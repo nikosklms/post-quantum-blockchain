@@ -32,7 +32,8 @@ impl Block {
             hash: String::new(),
         };
 
-        block.mine_block();
+        // Initialize hash (it's invalid until mined)
+        block.hash = block.calculate_hash();
         block
     }
 
@@ -45,7 +46,9 @@ impl Block {
             transactions: vec![],
             hash: String::new(),
         };
-        block.mine_block();
+        // Create a dummy "false" signal for genesis (never cancel)
+        let stop_signal = std::sync::atomic::AtomicBool::new(false);
+        block.mine_block(&stop_signal);
         block
     }
 
@@ -62,16 +65,20 @@ impl Block {
         format!("{:x}", result)
     }
 
-    fn mine_block(&mut self) {
+    pub fn mine_block(&mut self, stop_signal: &std::sync::atomic::AtomicBool) {
         let target = "0".repeat(DIFFICULTY);
+        use std::sync::atomic::Ordering;
 
-        loop {
-            self.hash = self.calculate_hash();
-            if self.hash.starts_with(&target) {
-                println!("⛏️  Block Mined: {}", self.hash);
-                break;
+        while !self.hash.starts_with(&target) {
+            // Check if we should stop
+            if stop_signal.load(Ordering::Relaxed) {
+                println!("🛑 Mining cancelled!");
+                return;
             }
+
             self.nonce += 1;
+            self.hash = self.calculate_hash();
         }
+        println!("⛏️  Block Mined: {}", self.hash);
     }
 }

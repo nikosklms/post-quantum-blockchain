@@ -19,8 +19,9 @@ cargo run
 ```
 
 ### Commands
-- `mine <sender> <receiver> <amount>`: Mine a block and broadcast it.
-- `mine_local <sender> <receiver> <amount>`: Mine a block **locally** (for testing conflicts).
+- `trans <receiver> <amount>`: Broadcast a transaction to the network (does NOT mine).
+- `mine`: Mine a new block containing pending transactions from the mempool.
+- `mine_local <receiver> <amount>`: Mine a block **locally** (for testing conflicts).
 - `sync`: Broadcast your full chain to peers (triggers consensus).
 - `chain`: View the current blockchain.
 - `peers`: View connected peers.

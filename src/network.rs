@@ -1,28 +1,36 @@
 use serde::{Deserialize, Serialize};
-use std::collections::{hash_map::DefaultHasher, HashMap};
+use std::collections::{hash_map::DefaultHasher, HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::time::{Duration, Instant};
 use libp2p::{
     gossipsub, mdns, noise, PeerId,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Swarm, ping,
+    request_response,
 };
 use crate::block::Block;
 use crate::blockchain::Blockchain;
+use crate::transaction::Transaction;
+use crate::sync::{SyncRequest, SyncResponse};
 
 const TOPIC: &str = "blocks";
 const PING_INTERVAL: Duration = Duration::from_secs(5);
-const PING_TIMEOUT_MULTIPLIER: u32 = 3;
+const SYNC_CHUNK_SIZE: u32 = 50;           // blocks per request
+pub const MAX_IN_FLIGHT_PER_PEER: usize = 2;   // concurrent requests per peer
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-// Custom NetworkBehaviour combining GossipSub + mDNS + Ping
+// ─── Combined Behaviour ───────────────────────────────────────────────────────
+
 #[derive(NetworkBehaviour)]
 pub struct BlockchainBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     pub mdns: mdns::tokio::Behaviour,
     pub ping: ping::Behaviour,
+    pub direct_sync: request_response::cbor::Behaviour<SyncRequest, SyncResponse>,
 }
 
-/// Track peer health based on ping/pong
+// ─── Peer Health Tracker ──────────────────────────────────────────────────────
+
 pub struct PeerHealthTracker {
     last_pong: HashMap<PeerId, Instant>,
     timeout: Duration,
@@ -36,22 +44,18 @@ impl PeerHealthTracker {
         }
     }
 
-    /// Update the last pong time for a peer
     pub fn record_pong(&mut self, peer_id: PeerId) {
         self.last_pong.insert(peer_id, Instant::now());
     }
 
-    /// Register a new peer
     pub fn add_peer(&mut self, peer_id: PeerId) {
         self.last_pong.insert(peer_id, Instant::now());
     }
 
-    /// Remove a peer
     pub fn remove_peer(&mut self, peer_id: &PeerId) {
         self.last_pong.remove(peer_id);
     }
 
-    /// Check for stale peers and return list of peers to disconnect
     pub fn check_stale_peers(&self) -> Vec<PeerId> {
         let now = Instant::now();
         self.last_pong
@@ -62,7 +66,184 @@ impl PeerHealthTracker {
     }
 }
 
-/// Create and configure the libp2p Swarm
+// ─── Sync Manager (Work-Queue Scheduler) ──────────────────────────────────────
+
+/// A request that is currently in-flight to a peer
+struct InFlightRequest {
+    start_height: u32,
+    end_height: u32,
+    sent_at: Instant,
+}
+
+pub struct SyncManager {
+    /// Heights reported by peers via ChainParams
+    pub peer_heights: HashMap<PeerId, u32>,
+    /// Global work queue: chunks (start, end) we still need to fetch
+    work_queue: VecDeque<(u32, u32)>,
+    /// Per-peer in-flight requests
+    in_flight: HashMap<PeerId, Vec<InFlightRequest>>,
+    /// Highest height we've generated work for (avoids duplicate chunks)
+    scheduled_up_to: u32,
+}
+
+impl SyncManager {
+    pub fn new() -> Self {
+        Self {
+            peer_heights: HashMap::new(),
+            work_queue: VecDeque::new(),
+            in_flight: HashMap::new(),
+            scheduled_up_to: 0,
+        }
+    }
+
+    /// Record a peer's chain height. If new target is higher, generate new work.
+    pub fn record_peer_height(&mut self, peer_id: PeerId, height: u32, my_height: u32) {
+        self.peer_heights.insert(peer_id, height);
+        self.ensure_work_generated(my_height);
+    }
+
+    /// Remove a peer and re-queue any of its in-flight work
+    pub fn remove_peer(&mut self, peer_id: &PeerId) {
+        self.peer_heights.remove(peer_id);
+        if let Some(requests) = self.in_flight.remove(peer_id) {
+            for req in requests {
+                println!("♻️  Re-queuing blocks {}-{} (peer disconnected)", req.start_height, req.end_height);
+                self.work_queue.push_front((req.start_height, req.end_height));
+            }
+        }
+    }
+
+    /// Called when a response arrives from a peer — clears in-flight entry
+    pub fn on_response(&mut self, peer: &PeerId, blocks_start: u32, blocks_end: u32) {
+        if let Some(reqs) = self.in_flight.get_mut(peer) {
+            reqs.retain(|r| !(r.start_height == blocks_start && r.end_height == blocks_end));
+        }
+    }
+
+    /// Generate work chunks up to the max known peer height
+    fn ensure_work_generated(&mut self, my_height: u32) {
+        let target = self.peer_heights.values().max().copied().unwrap_or(0);
+        // Start from whichever is higher: our chain tip or what we've already scheduled
+        let start_from = std::cmp::max(my_height, self.scheduled_up_to) + 1;
+
+        if target < start_from {
+            return;
+        }
+
+        let mut s = start_from;
+        while s <= target {
+            let e = std::cmp::min(s + SYNC_CHUNK_SIZE - 1, target);
+            self.work_queue.push_back((s, e));
+            s = e + 1;
+        }
+        self.scheduled_up_to = target;
+    }
+
+    /// Periodic tick: assign work to peers with capacity, retry timed-out requests.
+    /// Call this every ~1s from the main loop.
+    pub fn tick(
+        &mut self,
+        swarm: &mut Swarm<BlockchainBehaviour>,
+        my_height: u32,
+    ) {
+        let assignments = self.plan_assignments(my_height);
+        for (peer, s, e) in assignments {
+            println!("  📡 Requesting blocks {}-{} from {}", s, e, peer);
+            let request = SyncRequest { start_height: s, end_height: e };
+            swarm.behaviour_mut().direct_sync.send_request(&peer, request);
+        }
+    }
+
+    /// Pure scheduling logic: decides which chunks to assign to which peers.
+    /// Returns Vec<(peer, start_height, end_height)> — the assignments for this tick.
+    /// Separated from tick() so it can be unit-tested without a Swarm.
+    pub fn plan_assignments(&mut self, my_height: u32) -> Vec<(PeerId, u32, u32)> {
+        // 1. Re-generate work if our chain advanced or new peers appeared
+        self.ensure_work_generated(my_height);
+
+        // 2. Check for timed-out requests → re-queue
+        let mut timed_out: Vec<(PeerId, u32, u32)> = Vec::new();
+        for (&peer, reqs) in &self.in_flight {
+            for req in reqs {
+                if req.sent_at.elapsed() > REQUEST_TIMEOUT {
+                    timed_out.push((peer, req.start_height, req.end_height));
+                }
+            }
+        }
+        for (peer, s, e) in timed_out {
+            println!("⏰ Request {}-{} to {} timed out, re-queuing", s, e, peer);
+            if let Some(reqs) = self.in_flight.get_mut(&peer) {
+                reqs.retain(|r| !(r.start_height == s && r.end_height == e));
+            }
+            self.work_queue.push_front((s, e));
+        }
+
+        // 3. Remove work that we already have (chain advanced past it)
+        while let Some(&(s, _e)) = self.work_queue.front() {
+            if s <= my_height {
+                self.work_queue.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // 4. Assign work to peers with capacity
+        let eligible: Vec<PeerId> = self.peer_heights
+            .iter()
+            .filter(|&(_, &h)| h > my_height)
+            .map(|(&pid, _)| pid)
+            .collect();
+
+        let mut assignments = Vec::new();
+
+        for peer in eligible {
+            let current = self.in_flight.entry(peer).or_insert_with(Vec::new);
+            while current.len() < MAX_IN_FLIGHT_PER_PEER {
+                if let Some((s, e)) = self.work_queue.pop_front() {
+                    if s <= my_height {
+                        continue;
+                    }
+                    assignments.push((peer, s, e));
+                    current.push(InFlightRequest {
+                        start_height: s,
+                        end_height: e,
+                        sent_at: Instant::now(),
+                    });
+                } else {
+                    break;
+                }
+            }
+        }
+
+        assignments
+    }
+
+    /// Is the sync fully complete? (no work left, nothing in flight)
+    pub fn is_idle(&self) -> bool {
+        self.work_queue.is_empty()
+            && self.in_flight.values().all(|v| v.is_empty())
+    }
+
+    /// Status summary for logging
+    pub fn status(&self) -> String {
+        let in_flight_total: usize = self.in_flight.values().map(|v| v.len()).sum();
+        format!("queue={}, in_flight={}, peers={}",
+                self.work_queue.len(), in_flight_total, self.peer_heights.len())
+    }
+
+    /// Number of items remaining in the work queue
+    pub fn work_queue_len(&self) -> usize {
+        self.work_queue.len()
+    }
+
+    /// Number of in-flight requests for a specific peer
+    pub fn in_flight_count(&self, peer: &PeerId) -> usize {
+        self.in_flight.get(peer).map_or(0, |v| v.len())
+    }
+}
+
+// ─── Swarm Construction ───────────────────────────────────────────────────────
+
 pub fn create_swarm() -> Result<Swarm<BlockchainBehaviour>, Box<dyn std::error::Error>> {
     let swarm = libp2p::SwarmBuilder::with_new_identity()
         .with_tokio()
@@ -72,7 +253,6 @@ pub fn create_swarm() -> Result<Swarm<BlockchainBehaviour>, Box<dyn std::error::
             yamux::Config::default,
         )?
         .with_behaviour(|key| {
-            // Content-address messages by hashing their data
             let message_id_fn = |message: &gossipsub::Message| {
                 let mut s = DefaultHasher::new();
                 message.data.hash(&mut s);
@@ -95,11 +275,16 @@ pub fn create_swarm() -> Result<Swarm<BlockchainBehaviour>, Box<dyn std::error::
 
             let ping = ping::Behaviour::new(ping::Config::new().with_interval(PING_INTERVAL));
 
-            Ok(BlockchainBehaviour {
-                gossipsub,
-                mdns,
-                ping
-            })
+            // Direct sync: request-response with CBOR codec
+            let direct_sync = request_response::cbor::Behaviour::new(
+                [(
+                    libp2p::StreamProtocol::new("/blockchain/sync/1.0.0"),
+                    request_response::ProtocolSupport::Full,
+                )],
+                request_response::Config::default(),
+            );
+
+            Ok(BlockchainBehaviour { gossipsub, mdns, ping, direct_sync })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
@@ -107,20 +292,31 @@ pub fn create_swarm() -> Result<Swarm<BlockchainBehaviour>, Box<dyn std::error::
     Ok(swarm)
 }
 
-/// Get the GossipSub topic for block broadcasting
+// ─── GossipSub Messages (reduced: only new blocks, txs, discovery) ───────────
+
 pub fn get_topic() -> gossipsub::IdentTopic {
     gossipsub::IdentTopic::new(TOPIC)
 }
 
-/// Publish a mined block to the network
+/// Messages that still travel over GossipSub (broadcast)
+#[derive(Debug, Serialize, Deserialize)]
+pub enum NetworkMessage {
+    /// A newly mined block (broadcast to all)
+    Block { block: Block, request_id: String },
+    /// A new transaction (broadcast to all)
+    Transaction(Transaction),
+    /// Discovery: ask peers for their chain height
+    RequestChain { request_id: String },
+    /// Discovery: response with chain height
+    ChainParams { best_hash: String, height: u32, request_id: String },
+}
 
+pub fn publish_block(swarm: &mut Swarm<BlockchainBehaviour>, block: Block) {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let id: u64 = rng.r#gen();
 
-/// Publish a mined block to the network
-pub fn publish_block(
-    swarm: &mut Swarm<BlockchainBehaviour>,
-    block: Block,
-) {
-    let msg = NetworkMessage::Block(block);
+    let msg = NetworkMessage::Block { block, request_id: id.to_string() };
     let json = serde_json::to_string(&msg).expect("Failed to serialize block");
     let topic = get_topic();
     if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, json.as_bytes()) {
@@ -128,34 +324,26 @@ pub fn publish_block(
     }
 }
 
-/// Publish the full chain to the network (Sync)
-pub fn publish_chain(
-    swarm: &mut Swarm<BlockchainBehaviour>,
-    chain: Vec<Block>,
-) {
-    let msg = NetworkMessage::Chain(chain);
-    let json = serde_json::to_string(&msg).expect("Failed to serialize chain");
+pub fn publish_transaction(swarm: &mut Swarm<BlockchainBehaviour>, tx: Transaction) {
+    let msg = NetworkMessage::Transaction(tx);
+    let json = serde_json::to_string(&msg).expect("Failed to serialize transaction");
     let topic = get_topic();
     if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, json.as_bytes()) {
-        println!("Failed to publish chain: {:?}", e);
+        println!("Failed to publish transaction: {:?}", e);
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub enum NetworkMessage {
-    Block(Block),
-    Chain(Vec<Block>),
-}
+// ─── Event Handling ───────────────────────────────────────────────────────────
 
-/// Handle a swarm event
 pub fn handle_swarm_event(
     event: SwarmEvent<BlockchainBehaviourEvent>,
     swarm: &mut Swarm<BlockchainBehaviour>,
     blockchain: &mut Blockchain,
     peer_tracker: &mut PeerHealthTracker,
-) {
+    sync_manager: &mut SyncManager,
+) -> bool {
     match event {
-        // mDNS: new peer discovered
+        // ── mDNS: peer discovered ──
         SwarmEvent::Behaviour(BlockchainBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
             for (peer_id, multiaddr) in list {
                 if let Err(e) = swarm.dial(multiaddr.clone()) {
@@ -164,103 +352,213 @@ pub fn handle_swarm_event(
                 println!("mDNS discovered a new peer: {peer_id} at {multiaddr}");
                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
             }
+            false
         }
 
-        // mDNS: peer expired
+        // ── mDNS: peer expired ──
         SwarmEvent::Behaviour(BlockchainBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
             for (peer_id, multiaddr) in list {
                 println!("mDNS peer expired: {peer_id} at {multiaddr}");
                 swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                 peer_tracker.remove_peer(&peer_id);
+                sync_manager.remove_peer(&peer_id);
             }
+            false
         }
 
-        // Ping: Pong received
+        // ── Ping ──
         SwarmEvent::Behaviour(BlockchainBehaviourEvent::Ping(ping::Event {
             peer,
-            result: Ok(rtt),
+            result: Ok(_),
             ..
         })) => {
-            //println!("🏓 PONG received from {} (RTT: {:?})", peer, rtt);
             peer_tracker.record_pong(peer);
+            false
         }
 
-        // Ping: Ping failed
         SwarmEvent::Behaviour(BlockchainBehaviourEvent::Ping(ping::Event {
             peer,
             result: Err(e),
             ..
         })) => {
             println!("❌ PING failed to {}: {:?}", peer, e);
+            false
         }
 
-        // GossipSub: received a data from the network
-        SwarmEvent::Behaviour(BlockchainBehaviourEvent::Gossipsub(
-            gossipsub::Event::Message {
-                propagation_source: peer_id,
-                message,
-                ..
-            },
-        )) => {
-            let data = String::from_utf8_lossy(&message.data);
-            match serde_json::from_str::<NetworkMessage>(&data) {
-                Ok(NetworkMessage::Block(block)) => {
-                    println!("\nReceived block {} from peer {}", block.index, peer_id);
-                    if blockchain.try_add_block(block) {
-                        println!("Block added to chain! Chain length: {}", blockchain.chain.len());
-                    } else {
-                        println!("Block rejected (invalid).");
+        // ── Direct Sync (request-response) ──
+        SwarmEvent::Behaviour(BlockchainBehaviourEvent::DirectSync(event)) => {
+            match event {
+                request_response::Event::Message { peer, message, .. } => {
+                    match message {
+                        // INCOMING REQUEST: peer wants blocks from us
+                        request_response::Message::Request { request, channel, .. } => {
+                            println!("📥 Sync request from {}: blocks {}-{}",
+                                     peer, request.start_height, request.end_height);
+
+                            let blocks: Vec<Block> = (request.start_height..=request.end_height)
+                                .filter_map(|i| blockchain.chain.get(i as usize).cloned())
+                                .collect();
+
+                            println!("📤 Sending {} blocks to {}", blocks.len(), peer);
+                            let response = SyncResponse { blocks };
+                            if let Err(e) = swarm.behaviour_mut().direct_sync.send_response(channel, response) {
+                                println!("Failed to send sync response: {:?}", e);
+                            }
+                            false
+                        }
+
+                        // INCOMING RESPONSE: we received blocks we asked for
+                        request_response::Message::Response { response, .. } => {
+                            let count = response.blocks.len();
+                            if count > 0 {
+                                let first = response.blocks.first().unwrap().index;
+                                let last = response.blocks.last().unwrap().index;
+                                println!("📥 Received {} blocks ({}-{}) from {}", count, first, last, peer);
+                                // Clear from in-flight
+                                sync_manager.on_response(&peer, first, last);
+                                let added = blockchain.try_add_block_batch(response.blocks);
+                                if added > 0 {
+                                    println!("✅ Added {} blocks. Chain height: {}", added, blockchain.chain.len() - 1);
+                                    if sync_manager.is_idle() {
+                                        println!("🎉 Sync complete! Height: {}", blockchain.chain.last().unwrap().index);
+                                    }
+                                    true // signal: chain changed, cancel mining
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        }
                     }
                 }
-                Ok(NetworkMessage::Chain(chain)) => {
-                    println!("\nReceived full chain from peer {} (len {})", peer_id, chain.len());
-                    if blockchain.replace_chain(chain) {
-                        println!("Chain replaced! New length: {}", blockchain.chain.len());
-                    } else {
-                        println!("Chain rejected (shorter or invalid).");
-                    }
+                request_response::Event::OutboundFailure { peer, error, .. } => {
+                    println!("⚠️  Sync request to {} failed: {:?}", peer, error);
+                    // Re-queue any work assigned to this peer
+                    sync_manager.remove_peer(&peer);
+                    false
                 }
-                Err(e) => {
-                    println!("Failed to deserialize message from peer {}: {}", peer_id, e);
+                request_response::Event::InboundFailure { peer, error, .. } => {
+                    println!("⚠️  Sync response to {} failed: {:?}", peer, error);
+                    false
                 }
+                _ => false,
             }
         }
 
-        // New listen address
-        SwarmEvent::NewListenAddr { address, .. } => {
-            println!("Listening on {address}");
+        // ── GossipSub (broadcasts: new blocks, txs, discovery) ──
+        SwarmEvent::Behaviour(BlockchainBehaviourEvent::Gossipsub(event)) => {
+            match event {
+                gossipsub::Event::Message { propagation_source: peer_id, message, .. } => {
+                    let data = String::from_utf8_lossy(&message.data);
+                    match serde_json::from_str::<NetworkMessage>(&data) {
+                        // Discovery: peer asks for our chain status
+                        Ok(NetworkMessage::RequestChain { request_id }) => {
+                            let best = blockchain.chain.last().unwrap();
+                            let msg = NetworkMessage::ChainParams {
+                                best_hash: best.hash.clone(),
+                                height: best.index,
+                                request_id,
+                            };
+                            let json = serde_json::to_string(&msg).expect("ser");
+                            let topic = get_topic();
+                            let _ = swarm.behaviour_mut().gossipsub.publish(topic, json.as_bytes());
+                            false
+                        }
+
+                        // Discovery: peer tells us their height → feed SyncManager
+                        Ok(NetworkMessage::ChainParams { height, request_id: _, best_hash: _ }) => {
+                            println!("Peer {} is at height {}", peer_id, height);
+                            let my_height = blockchain.chain.last().unwrap().index;
+                            sync_manager.record_peer_height(peer_id, height, my_height);
+                            // No immediate sync trigger — tick() will handle scheduling
+                            false
+                        }
+
+                        // New mined block (gossip broadcast)
+                        Ok(NetworkMessage::Block { block, request_id: _ }) => {
+                            match blockchain.try_add_block(block.clone()) {
+                                crate::blockchain::AddBlockResult::Added => {
+                                    println!("\n⛏️  New block {} from peer {}", block.index, peer_id);
+                                    println!("Chain height: {}", blockchain.chain.len() - 1);
+                                    true
+                                }
+                                crate::blockchain::AddBlockResult::Buffered => false,
+                                crate::blockchain::AddBlockResult::Exists => false,
+                                crate::blockchain::AddBlockResult::Invalid => {
+                                    println!("Block {} from {} rejected.", block.index, peer_id);
+                                    false
+                                }
+                            }
+                        }
+
+                        // Transaction
+                        Ok(NetworkMessage::Transaction(tx)) => {
+                            if blockchain.add_to_mempool(tx) {
+                                println!("Transaction received and added to mempool.");
+                            }
+                            false
+                        }
+
+                        Err(e) => {
+                            println!("Failed to deserialize gossip from {}: {}", peer_id, e);
+                            false
+                        }
+                    }
+                }
+
+                gossipsub::Event::Subscribed { peer_id, topic: _ } => {
+                    // New peer joined topic → ask for their chain height
+                    println!("🔄 New peer {} subscribed. Asking for chain status...", peer_id);
+                    use rand::Rng;
+                    let mut rng = rand::thread_rng();
+                    let id: u64 = rng.r#gen();
+                    let msg = NetworkMessage::RequestChain { request_id: id.to_string() };
+                    let json = serde_json::to_string(&msg).expect("ser");
+                    let t = get_topic();
+                    let _ = swarm.behaviour_mut().gossipsub.publish(t, json.as_bytes());
+                    false
+                }
+
+                _ => false,
+            }
         }
 
+        // ── Connection lifecycle ──
+        SwarmEvent::NewListenAddr { address, .. } => {
+            println!("Listening on {address}");
+            false
+        }
         SwarmEvent::ConnectionEstablished { peer_id, .. } => {
             println!("Connection established with {}", peer_id);
             peer_tracker.add_peer(peer_id);
+            false
         }
-
         SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
             println!("Connection closed with {}: {:?}", peer_id, cause);
             peer_tracker.remove_peer(&peer_id);
+            sync_manager.remove_peer(&peer_id);
+            false
         }
-
         SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
             println!("Outgoing connection error to {:?}: {:?}", peer_id, error);
+            false
         }
-
-        _ => {}
+        _ => false,
     }
 }
 
-/// Check for and disconnect stale peers
+// ─── Stale Peer Cleanup ──────────────────────────────────────────────────────
+
 pub fn check_and_disconnect_stale_peers(
     swarm: &mut Swarm<BlockchainBehaviour>,
     peer_tracker: &mut PeerHealthTracker,
 ) {
     let stale_peers = peer_tracker.check_stale_peers();
-    
+
     for peer_id in stale_peers {
-        println!("⚠️  Peer {} is stale (no pong for {}s), disconnecting...", 
-                 peer_id, 
-                 PING_INTERVAL.as_secs() * PING_TIMEOUT_MULTIPLIER as u64);
-        
+        println!("⚠️  Peer {} is stale, disconnecting...", peer_id);
+
         if let Err(e) = swarm.disconnect_peer_id(peer_id) {
             println!("Failed to disconnect peer {}: {:?}", peer_id, e);
         } else {

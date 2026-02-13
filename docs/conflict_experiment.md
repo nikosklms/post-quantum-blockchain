@@ -21,15 +21,15 @@ We will create two conflicting chains starting from the same Genesis block.
 **On Node A (The "Short" Chain):**
 We'll mine one block locally so Node B doesn't see it yet.
 ```bash
-mine_local alice bob 10
+mine_local bob 10
 # Node A Height: 2 (Genesis + Block 1A)
 ```
 
 **On Node B (The "Long" Chain):**
 We'll mine two blocks locally so Node A doesn't see them yet.
 ```bash
-mine_local charlie dave 5
-mine_local charlie dave 5
+mine_local dave 5
+mine_local dave 5
 # Node B Height: 3 (Genesis + Block 1B + Block 2B)
 ```
 
