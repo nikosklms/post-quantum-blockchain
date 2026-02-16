@@ -1,5 +1,6 @@
 use k256::ecdsa::{SigningKey, VerifyingKey, Signature, signature::Signer, signature::Verifier};
 use rand::rngs::OsRng;
+use std::fs;
 
 #[derive(Clone)]
 pub struct Wallet {
@@ -17,6 +18,30 @@ impl Wallet {
             verifying_key,
         }
     }
+
+    // /// Save wallet private key to a file (hex encoded)
+    // pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
+    //     let private_key_bytes = self.signing_key.to_bytes();
+    //     let hex_key = hex::encode(private_key_bytes);
+    //     fs::write(path, hex_key)?;
+    //     Ok(())
+    // }
+
+    // /// Load wallet from a file containing hex-encoded private key
+    // pub fn load_from_file(path: &str) -> std::io::Result<Self> {
+    //     let hex_key = fs::read_to_string(path)?;
+    //     let bytes = hex::decode(hex_key.trim())
+    //         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        
+    //     let signing_key = SigningKey::from_slice(&bytes)
+    //         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    //     let verifying_key = VerifyingKey::from(&signing_key);
+        
+    //     Ok(Self {
+    //         signing_key,
+    //         verifying_key,
+    //     })
+    // }
 
     /// Sign a message (byte slice) and return the signature as a hex string
     pub fn sign(&self, message: &[u8]) -> String {

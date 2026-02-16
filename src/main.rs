@@ -21,10 +21,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize blockchain
     let mut blockchain = Blockchain::new();
 
-    // Create a local wallet
+    // Create a new wallet (persistence removed for now)
     let wallet = Wallet::new();
+    
     let public_key = wallet.get_public_key();
-    println!("🔑 Local Wallet Created!");
     println!("Public Key: {}", public_key);
     println!("(Start mining to earn coins!)");
 
@@ -43,6 +43,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check for stale peers every 1 second
     let mut check_interval = interval(Duration::from_secs(1));
 
+    // Re-broadcast mempool transactions every 30 seconds
+    let mut rebroadcast_interval = interval(Duration::from_secs(30));
+
     // Subscribe to the blocks topic
     let topic = network::get_topic();
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
@@ -52,9 +55,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("\nBlockchain P2P Node Started!");
     println!("Commands:");
-    println!("  trans <receiver> <amount>      - Create and broadcast a transaction");
-    println!("  mine                           - Mine a new block with pending transactions");
-    println!("  mine_local <receiver> <amount> - Mine a new block LOCALLY only (for conflicts)");
+    println!("  sendtoaddress <addr> <amount>  - Send coins to one recipient");
+    println!("  sendmany <a1>,<a2> <v1>,<v2>   - Send coins to multiple recipients");
+    println!("  mine                           - Mine a new block (earns reward!)");
+    println!("  mine_batch <count>             - Mine N blocks (for testing sync)");
+    println!("  mine_local                     - Mine a new block LOCALLY only (for conflicts)");
+    println!("  balance                        - Show your wallet balance");
+    println!("  utxos                          - Print all unspent transaction outputs");
     println!("  chain                          - Print the blockchain");
     println!("  validate                       - Validate the chain");
     println!("  sync                           - Request missing blocks from peers");
@@ -68,6 +75,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Cancellation token for the active mining thread
     let mut current_mining_cancellation_token: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
+    let mut mining_batch_remaining: u32 = 0;
 
     // Main event loop
     loop {
@@ -75,10 +83,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Handle mined block from the background thread
             Some(mined_block) = mining_receiver.recv() => {
                 println!("⛏️  Block mined successfully! Hash: {}", mined_block.hash);
-                blockchain.try_add_block(mined_block.clone()); // Add to chain & clear mempool
+                blockchain.try_add_block(mined_block.clone());
+                let balance = blockchain.get_balance(&public_key);
+                println!("Block published to network. Your balance: {} coins", balance);
                 network::publish_block(&mut swarm, mined_block);
-                println!("Block published to network.");
-                current_mining_cancellation_token = None; // Reset token since mining is done
+
+                // If executing a batch, start the next one immediately
+                current_mining_cancellation_token = None;
+                if mining_batch_remaining > 0 {
+                    mining_batch_remaining -= 1;
+                    start_mining_job(
+                        &blockchain, 
+                        &public_key, 
+                        mining_sender.clone(), 
+                        &mut current_mining_cancellation_token
+                    );
+                }
             }
             
             // Handle user input from stdin
@@ -89,9 +109,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 match parts[0] {
-                    "trans" => {
+                    "sendtoaddress" => {
                         if parts.len() < 3 {
-                            println!("Usage: trans <receiver> <amount>");
+                            println!("Usage: sendtoaddress <receiver> <amount>");
                             continue;
                         }
 
@@ -103,20 +123,78 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         };
 
-                        let tx = Transaction::new(
-                            public_key.clone(),
-                            parts[1].to_string(),
-                            amount,
-                            &wallet
-                        );
-                        
-                        println!("Transaction created: {} -> {} ({})", tx.sender, tx.receiver, tx.amount);
-                        
-                        // Add to local mempool
+                        let (inputs, total) = blockchain.find_spendable_outputs(&public_key, amount);
+                        if total < amount {
+                            println!("Insufficient balance! Have {}, need {}", total, amount);
+                            continue;
+                        }
+
+                        let tx = Transaction::new(inputs, parts[1], amount, &wallet);
+
+                        let change = total - amount;
+                        if change > 0.0001 {
+                            println!("Transaction: {} → {} (change: {})", amount, parts[1], change);
+                        } else {
+                            println!("Transaction: {} → {}", amount, parts[1]);
+                        }
+
                         blockchain.add_to_mempool(tx.clone());
-                        println!("Added to local mempool.");
-                        
-                        // Broadcast to network
+                        network::publish_transaction(&mut swarm, tx);
+                        println!("Broadcasted to network.");
+                    }
+
+                    "sendmany" => {
+                        // Usage: sendmany addr1,addr2,addr3 10,20,30
+                        if parts.len() < 3 {
+                            println!("Usage: sendmany <addr1>,<addr2> <amount1>,<amount2>");
+                            continue;
+                        }
+
+                        let addrs: Vec<&str> = parts[1].split(',').collect();
+                        let amounts: Vec<&str> = parts[2].split(',').collect();
+
+                        if addrs.len() != amounts.len() {
+                            println!("Mismatch: {} addresses but {} amounts", addrs.len(), amounts.len());
+                            continue;
+                        }
+
+                        let mut recipients: Vec<(&str, f64)> = Vec::new();
+                        let mut total_needed = 0.0;
+                        let mut parse_error = false;
+
+                        for (addr, amt_str) in addrs.iter().zip(amounts.iter()) {
+                            match amt_str.parse::<f64>() {
+                                Ok(amt) => {
+                                    recipients.push((addr, amt));
+                                    total_needed += amt;
+                                }
+                                Err(_) => {
+                                    println!("Invalid amount: {}", amt_str);
+                                    parse_error = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if parse_error { continue; }
+
+                        let (inputs, total) = blockchain.find_spendable_outputs(&public_key, total_needed);
+                        if total < total_needed {
+                            println!("Insufficient balance! Have {}, need {}", total, total_needed);
+                            continue;
+                        }
+
+                        let tx = Transaction::new_multi(inputs, recipients.clone(), &wallet);
+
+                        println!("sendmany ({} recipients, total: {}):", recipients.len(), total_needed);
+                        for (addr, amt) in &recipients {
+                            println!("  {} → {}", amt, &addr[..std::cmp::min(16, addr.len())]);
+                        }
+                        let change = total - total_needed;
+                        if change > 0.0001 {
+                            println!("  {} → you (change)", change);
+                        }
+
+                        blockchain.add_to_mempool(tx.clone());
                         network::publish_transaction(&mut swarm, tx);
                         println!("Broadcasted to network.");
                     }
@@ -128,68 +206,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
 
-                        let txs: Vec<Transaction> = blockchain.mempool.iter().take(2000).cloned().collect();
-                        if txs.is_empty() {
-                            println!("Mempool is empty. (Nothing to mine)");
+                        // Stop any batch mining if single mine is called (though usually batch runs)
+                        mining_batch_remaining = 0;
+                        
+                        start_mining_job(
+                            &blockchain, 
+                            &public_key, 
+                            mining_sender.clone(), 
+                            &mut current_mining_cancellation_token
+                        );
+                    }
+
+                    "mine_batch" => {
+                        // Check if already mining
+                        if current_mining_cancellation_token.is_some() {
+                            println!("⚠️  Already mining! Wait for the current block.");
                             continue;
                         }
 
-                        println!("Mining block with {} transactions...", txs.len());
-
-                        // Prepare block data for the thread
-                        let index = blockchain.chain.len() as u32;
-                        let previous_hash = blockchain.chain.last().unwrap().hash.clone();
-                        let txs_clone = txs.clone();
-
-                        // Create cancellation token
-                        let stop_signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                        current_mining_cancellation_token = Some(stop_signal.clone());
-
-                        // Clone the transmitter and signal for the thread
-                        let tx_mining = mining_sender.clone();
-                        let stop_signal_thread = stop_signal.clone();
+                        let count: u32 = match parts.get(1) {
+                            Some(s) => s.parse().unwrap_or(1),
+                            None => 1,
+                        };
+                        println!("Starting batch mining of {} blocks...", count);
                         
-                        // Spawn mining on a separate thread (non-blocking)
-                        let mut block = block::Block::new(index, txs_clone, previous_hash);
-                        
-                        tokio::task::spawn_blocking(move || {
-                            block.mine_block(&stop_signal_thread);
-                            // Send the mined block back to the main thread (only if not cancelled)
-                             if !stop_signal_thread.load(std::sync::atomic::Ordering::Relaxed) {
-                                if let Err(e) = tx_mining.blocking_send(block) {
-                                    println!("Error sending mined block: {}", e);
-                                }
-                             }
-                        });
-                        
-                        println!("Mining started in background...");
+                        if count > 0 {
+                            mining_batch_remaining = count - 1;
+                            start_mining_job(
+                                &blockchain, 
+                                &public_key, 
+                                mining_sender.clone(), 
+                                &mut current_mining_cancellation_token
+                            );
+                        }
                     }
 
                     "mine_local" => {
-                        if parts.len() < 3 {
-                            println!("Usage: mine_local <receiver> <amount>");
-                            continue;
-                        }
-
-                        let amount: f64 = match parts[2].parse() {
-                            Ok(a) => a,
-                            Err(_) => {
-                                println!("Invalid amount.");
-                                continue;
-                            }
-                        };
-
-                        let tx = Transaction::new(
-                            public_key.clone(),
-                            parts[1].to_string(),
-                            amount,
-                            &wallet
-                        );
-
-                        // Mine the block locally (DO NOT BROADCAST)
-                        blockchain.add_block(vec![tx]);
+                        // Mine a local block with coinbase only (for testing conflicts)
+                        let index = blockchain.chain.len() as u32;
+                        let coinbase = Transaction::new_coinbase(&public_key, index);
+                        blockchain.add_block(vec![coinbase]);
                         let block = blockchain.chain.last().unwrap();
                         println!("Local Block mined (hidden from peers)! Hash: {}", block.hash);
+                        println!("Your balance: {} coins", blockchain.get_balance(&public_key));
+                    }
+
+                    "balance" => {
+                        let balance = blockchain.get_balance(&public_key);
+                        println!("Wallet: {}", &public_key[..16]);
+                        println!("Balance: {} coins", balance);
+                        println!("UTXOs: {}", blockchain.utxo_set.len());
+                    }
+
+                    "utxos" => {
+                        if blockchain.utxo_set.is_empty() {
+                            println!("No UTXOs. Mine a block first!");
+                        } else {
+                            println!("\n📦 UTXO Set ({} entries):", blockchain.utxo_set.len());
+                            for ((txid, idx), output) in &blockchain.utxo_set {
+                                println!("  ({}, {}) → {:.4} coins → {}",
+                                    &txid[..8], idx, output.amount, &output.recipient[..16]);
+                            }
+                        }
                     }
 
                     "chain" => {
@@ -226,7 +304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     _ => {
-                        println!("Unknown command. Try: mine, chain, validate, sync, peers");
+                        println!("Unknown command. Try: mine, mine_batch, sendtoaddress, sendmany, balance, utxos, chain, validate, sync, peers");
                     }
                 }
             }
@@ -238,6 +316,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if let Some(token) = current_mining_cancellation_token.take() {
                         println!("⚡ New block received! Cancelling current mining job...");
                         token.store(true, std::sync::atomic::Ordering::Relaxed);
+                        
+                        // Resuming batch mining on new tip
+                        if mining_batch_remaining > 0 {
+                            println!("🔄 Resuming batch mining on new tip...");
+                            start_mining_job(
+                                &blockchain, 
+                                &public_key, 
+                                mining_sender.clone(), 
+                                &mut current_mining_cancellation_token
+                            );
+                        }
                     }
                 }
             }
@@ -249,6 +338,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let my_height = blockchain.chain.last().unwrap().index;
                 sync_manager.tick(&mut swarm, my_height);
             }
+
+            // Periodic mempool re-broadcast
+            _ = rebroadcast_interval.tick() => {
+                network::rebroadcast_mempool(&mut swarm, &blockchain);
+            }
         }
     }
+}
+// Helper function to start mining a single block
+fn start_mining_job(
+    blockchain: &Blockchain, 
+    public_key: &str, 
+    mining_sender: tokio::sync::mpsc::Sender<block::Block>,
+    cancellation_token_store: &mut Option<std::sync::Arc<std::sync::atomic::AtomicBool>>
+) {
+    // Prepare block data
+    let index = blockchain.chain.len() as u32;
+    let previous_hash = blockchain.chain.last().unwrap().hash.clone();
+
+    // Build transaction list: coinbase first, then mempool
+    let coinbase = Transaction::new_coinbase(public_key, index);
+    let reward = transaction::block_reward(index);
+    let mut txs: Vec<Transaction> = vec![coinbase];
+    let mempool_txs: Vec<Transaction> = blockchain.mempool.iter().take(2000).cloned().collect();
+    txs.extend(mempool_txs);
+
+    // Get current difficulty
+    let difficulty = blockchain.get_difficulty();
+    println!("Mining block {} ({} txs, reward: {} coins, difficulty: {})...",
+        index, txs.len(), reward, difficulty);
+
+    let txs_clone = txs.clone();
+
+    // Create cancellation token
+    let stop_signal = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    *cancellation_token_store = Some(stop_signal.clone());
+
+    let tx_mining = mining_sender;
+    let stop_signal_thread = stop_signal.clone();
+
+    // Spawn mining on a separate thread
+    let mut block = block::Block::new(index, txs_clone, previous_hash, difficulty);
+
+    tokio::task::spawn_blocking(move || {
+        block.mine_block(&stop_signal_thread);
+        if !stop_signal_thread.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Err(e) = tx_mining.blocking_send(block) {
+                println!("Error sending mined block: {}", e);
+            }
+        }
+    });
+
+    println!("Mining started in background...");
 }

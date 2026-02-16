@@ -309,6 +309,10 @@ pub enum NetworkMessage {
     RequestChain { request_id: String },
     /// Discovery: response with chain height
     ChainParams { best_hash: String, height: u32, request_id: String },
+    /// Mempool sync: ask peers for their pending transactions
+    RequestMempool,
+    /// Mempool sync: response with pending transactions
+    MempoolTxs { transactions: Vec<Transaction> },
 }
 
 pub fn publish_block(swarm: &mut Swarm<BlockchainBehaviour>, block: Block) {
@@ -331,6 +335,34 @@ pub fn publish_transaction(swarm: &mut Swarm<BlockchainBehaviour>, tx: Transacti
     if let Err(e) = swarm.behaviour_mut().gossipsub.publish(topic, json.as_bytes()) {
         println!("Failed to publish transaction: {:?}", e);
     }
+}
+
+pub fn publish_mempool_request(swarm: &mut Swarm<BlockchainBehaviour>) {
+    let msg = NetworkMessage::RequestMempool;
+    let json = serde_json::to_string(&msg).expect("Failed to serialize");
+    let topic = get_topic();
+    let _ = swarm.behaviour_mut().gossipsub.publish(topic, json.as_bytes());
+}
+
+pub fn publish_mempool_txs(swarm: &mut Swarm<BlockchainBehaviour>, transactions: Vec<Transaction>) {
+    if transactions.is_empty() { return; }
+    let msg = NetworkMessage::MempoolTxs { transactions };
+    let json = serde_json::to_string(&msg).expect("Failed to serialize");
+    let topic = get_topic();
+    let _ = swarm.behaviour_mut().gossipsub.publish(topic, json.as_bytes());
+}
+
+/// Re-broadcast all mempool transactions (ensures late-joining nodes get them)
+pub fn rebroadcast_mempool(swarm: &mut Swarm<BlockchainBehaviour>, blockchain: &Blockchain) {
+    if blockchain.mempool.is_empty() { return; }
+    let count = blockchain.mempool.len();
+    for tx in &blockchain.mempool {
+        let msg = NetworkMessage::Transaction(tx.clone());
+        let json = serde_json::to_string(&msg).expect("ser");
+        let topic = get_topic();
+        let _ = swarm.behaviour_mut().gossipsub.publish(topic, json.as_bytes());
+    }
+    println!("📡 Re-broadcast {} mempool transactions", count);
 }
 
 // ─── Event Handling ───────────────────────────────────────────────────────────
@@ -485,6 +517,11 @@ pub fn handle_swarm_event(
                                 }
                                 crate::blockchain::AddBlockResult::Buffered => false,
                                 crate::blockchain::AddBlockResult::Exists => false,
+                                crate::blockchain::AddBlockResult::Orphan(parent_idx) => {
+                                    println!("🔍 Asking {} for parent block {}", peer_id, parent_idx);
+                                    request_block(swarm, &peer_id, parent_idx);
+                                    false
+                                }
                                 crate::blockchain::AddBlockResult::Invalid => {
                                     println!("Block {} from {} rejected.", block.index, peer_id);
                                     false
@@ -500,6 +537,29 @@ pub fn handle_swarm_event(
                             false
                         }
 
+                        // Mempool sync: peer is asking for our mempool
+                        Ok(NetworkMessage::RequestMempool) => {
+                            if !blockchain.mempool.is_empty() {
+                                println!("📤 Sending {} mempool txs to peers", blockchain.mempool.len());
+                                publish_mempool_txs(swarm, blockchain.mempool.clone());
+                            }
+                            false
+                        }
+
+                        // Mempool sync: received mempool transactions from a peer
+                        Ok(NetworkMessage::MempoolTxs { transactions }) => {
+                            let mut added = 0;
+                            for tx in transactions {
+                                if blockchain.add_to_mempool(tx) {
+                                    added += 1;
+                                }
+                            }
+                            if added > 0 {
+                                println!("📥 Received {} new mempool transactions", added);
+                            }
+                            false
+                        }
+
                         Err(e) => {
                             println!("Failed to deserialize gossip from {}: {}", peer_id, e);
                             false
@@ -508,7 +568,7 @@ pub fn handle_swarm_event(
                 }
 
                 gossipsub::Event::Subscribed { peer_id, topic: _ } => {
-                    // New peer joined topic → ask for their chain height
+                    // New peer joined topic → ask for their chain height + mempool
                     println!("🔄 New peer {} subscribed. Asking for chain status...", peer_id);
                     use rand::Rng;
                     let mut rng = rand::thread_rng();
@@ -517,6 +577,8 @@ pub fn handle_swarm_event(
                     let json = serde_json::to_string(&msg).expect("ser");
                     let t = get_topic();
                     let _ = swarm.behaviour_mut().gossipsub.publish(t, json.as_bytes());
+                    // Also request mempool from peers
+                    publish_mempool_request(swarm);
                     false
                 }
 
@@ -565,4 +627,14 @@ pub fn check_and_disconnect_stale_peers(
             peer_tracker.remove_peer(&peer_id);
         }
     }
+}
+// Helper to request a single block from a peer
+pub fn request_block(
+    swarm: &mut Swarm<BlockchainBehaviour>,
+    peer: &PeerId,
+    height: u32
+) {
+    let request = SyncRequest { start_height: height, end_height: height };
+    swarm.behaviour_mut().direct_sync.send_request(peer, request);
+    println!("📡 Requesting orphan parent block {} from {}", height, peer);
 }

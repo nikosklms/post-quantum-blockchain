@@ -3,56 +3,245 @@ use crate::wallet::Wallet;
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+// ─── UTXO Transaction Model ──────────────────────────────────────────────────
+
+/// A reference to a specific output from a previous transaction being spent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxInput {
+    pub txid: String,        // Hash of the transaction that created the UTXO
+    pub output_index: u32,   // Which output of that transaction (0, 1, 2...)
+    pub signature: String,   // Proof that the spender owns this UTXO
+    pub pub_key: String,     // Spender's public key (for verification)
+}
+
+/// A new coin created by a transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxOutput {
+    pub amount: f64,         // Value of this coin
+    pub recipient: String,   // Owner's public key (who can spend this)
+}
+
+/// A UTXO-based transaction: destroys old coins (inputs) and creates new ones (outputs).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transaction {
-    pub sender: String,   // Public Key (Hex)
-    pub receiver: String, // Public Key (Hex)
-    pub amount: f64,
-    pub signature: String, // Hex
+    pub id: String,                // SHA-256 hash of (inputs + outputs + timestamp)
+    pub inputs: Vec<TxInput>,      // Coins being spent (destroyed)
+    pub outputs: Vec<TxOutput>,    // Coins being created
     pub timestamp: u128,
 }
 
+// ─── Block Reward with Halving ────────────────────────────────────────────────
+
+const INITIAL_REWARD: f64 = 50.0;
+const HALVING_INTERVAL: u32 = 1000;  // halves every 1000 blocks (fast for testing)
+pub const MAX_OUTPUTS_PER_TX: usize = 256;
+pub const MAX_INPUTS_PER_TX: usize = 256;
+
+/// Calculate the mining reward for a given block height.
+pub fn block_reward(height: u32) -> f64 {
+    let halvings = height / HALVING_INTERVAL;
+    if halvings >= 64 {
+        return 0.0; // reward vanishes after 64 halvings
+    }
+    INITIAL_REWARD / (2_u64.pow(halvings) as f64)
+}
+
+// ─── Transaction Implementation ──────────────────────────────────────────────
+
 impl Transaction {
-    pub fn new(sender: String, receiver: String, amount: f64, wallet: &Wallet) -> Self {
+    /// Create a coinbase transaction (mining reward — coins from nothing).
+    /// Has no inputs; a single output to the miner.
+    pub fn new_coinbase(to: &str, block_height: u32) -> Self {
+        let reward = block_reward(block_height);
+        let outputs = vec![TxOutput {
+            amount: reward,
+            recipient: to.to_string(),
+        }];
+
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
             .as_millis();
 
         let mut tx = Transaction {
-            sender,
-            receiver,
-            amount,
-            signature: String::new(),
+            id: String::new(),
+            inputs: vec![],  // no inputs — coinbase
+            outputs,
             timestamp,
         };
-
-        tx.signature = tx.sign(wallet);
+        tx.id = tx.calculate_hash();
         tx
     }
 
+    /// Create a regular transaction that spends existing UTXOs.
+    ///
+    /// `utxo_inputs`: the UTXOs being spent  — Vec<(txid, output_index, amount)>
+    /// `to`: recipient public key
+    /// `amount`: how much to send
+    /// `wallet`: sender's wallet (for signing)
+    ///
+    /// Automatically creates a change output if inputs > amount.
+    pub fn new(
+        utxo_inputs: Vec<(String, u32, f64)>,
+        to: &str,
+        amount: f64,
+        wallet: &Wallet,
+    ) -> Self {
+        let sender_key = wallet.get_public_key();
+        let input_total: f64 = utxo_inputs.iter().map(|(_, _, a)| a).sum();
+
+        // Build outputs
+        let mut outputs = vec![TxOutput {
+            amount,
+            recipient: to.to_string(),
+        }];
+
+        // Change back to sender if inputs > amount
+        let change = input_total - amount;
+        if change > 0.0001 {
+            outputs.push(TxOutput {
+                amount: change,
+                recipient: sender_key.clone(),
+            });
+        }
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis();
+
+        // Build inputs (unsigned first, then sign)
+        let inputs: Vec<TxInput> = utxo_inputs
+            .iter()
+            .map(|(txid, idx, _)| TxInput {
+                txid: txid.clone(),
+                output_index: *idx,
+                signature: String::new(), // placeholder
+                pub_key: sender_key.clone(),
+            })
+            .collect();
+
+        let mut tx = Transaction {
+            id: String::new(),
+            inputs,
+            outputs,
+            timestamp,
+        };
+        tx.id = tx.calculate_hash();
+
+        // Sign each input
+        for i in 0..tx.inputs.len() {
+            tx.inputs[i].signature = wallet.sign(tx.id.as_bytes());
+        }
+
+        tx
+    }
+
+    /// Create a transaction with multiple recipients (like Bitcoin's sendmany).
+    ///
+    /// `utxo_inputs`: UTXOs being spent — Vec<(txid, output_index, amount)>
+    /// `recipients`: list of (recipient_pubkey, amount)
+    /// `wallet`: sender's wallet (for signing)
+    pub fn new_multi(
+        utxo_inputs: Vec<(String, u32, f64)>,
+        recipients: Vec<(&str, f64)>,
+        wallet: &Wallet,
+    ) -> Self {
+        let sender_key = wallet.get_public_key();
+        let input_total: f64 = utxo_inputs.iter().map(|(_, _, a)| a).sum();
+        let output_total: f64 = recipients.iter().map(|(_, a)| a).sum();
+
+        // Build recipient outputs
+        let mut outputs: Vec<TxOutput> = recipients
+            .iter()
+            .map(|(to, amt)| TxOutput {
+                amount: *amt,
+                recipient: to.to_string(),
+            })
+            .collect();
+
+        // Change back to sender
+        let change = input_total - output_total;
+        if change > 0.0001 {
+            outputs.push(TxOutput {
+                amount: change,
+                recipient: sender_key.clone(),
+            });
+        }
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis();
+
+        let inputs: Vec<TxInput> = utxo_inputs
+            .iter()
+            .map(|(txid, idx, _)| TxInput {
+                txid: txid.clone(),
+                output_index: *idx,
+                signature: String::new(),
+                pub_key: sender_key.clone(),
+            })
+            .collect();
+
+        let mut tx = Transaction {
+            id: String::new(),
+            inputs,
+            outputs,
+            timestamp,
+        };
+        tx.id = tx.calculate_hash();
+
+        for i in 0..tx.inputs.len() {
+            tx.inputs[i].signature = wallet.sign(tx.id.as_bytes());
+        }
+
+        tx
+    }
+
+    /// Compute the transaction ID (hash of inputs + outputs + timestamp).
     pub fn calculate_hash(&self) -> String {
-        let input = format!("{}{}{}{}", self.sender, self.receiver, self.amount, self.timestamp);
         let mut hasher = Sha256::new();
-        hasher.update(input);
+
+        // Hash inputs (txid + index)
+        for inp in &self.inputs {
+            hasher.update(inp.txid.as_bytes());
+            hasher.update(inp.output_index.to_le_bytes());
+        }
+
+        // Hash outputs (amount + recipient)
+        for out in &self.outputs {
+            hasher.update(out.amount.to_le_bytes());
+            hasher.update(out.recipient.as_bytes());
+        }
+
+        hasher.update(self.timestamp.to_le_bytes());
+
         format!("{:x}", hasher.finalize())
     }
 
-    pub fn sign(&self, wallet: &Wallet) -> String {
-        let hash = self.calculate_hash();
-        wallet.sign(hash.as_bytes())
+    /// Check if this is a coinbase transaction (no inputs = mining reward).
+    pub fn is_coinbase(&self) -> bool {
+        self.inputs.is_empty()
     }
 
-    pub fn verify(&self) -> bool {
-        // Coinabase transaction (Genesis) has no signature
-        if self.sender == "0" {
+    /// Verify all input signatures.
+    /// For coinbase transactions, always returns true.
+    pub fn verify_signatures(&self) -> bool {
+        if self.is_coinbase() {
             return true;
         }
 
-        let hash = self.calculate_hash();
-        Wallet::verify(hash.as_bytes(), &self.signature, &self.sender)
+        for input in &self.inputs {
+            if !Wallet::verify(self.id.as_bytes(), &input.signature, &input.pub_key) {
+                return false;
+            }
+        }
+        true
     }
 }
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -60,45 +249,77 @@ mod tests {
     use crate::wallet::Wallet;
 
     #[test]
-    fn test_valid_transaction() {
+    fn test_coinbase_transaction() {
         let wallet = Wallet::new();
-        let receiver = "some_receiver_key".to_string();
-        let tx = Transaction::new(wallet.get_public_key(), receiver, 10.0, &wallet);
+        let coinbase = Transaction::new_coinbase(&wallet.get_public_key(), 0);
 
-        assert!(tx.verify(), "Valid transaction should verify correctly");
+        assert!(coinbase.is_coinbase());
+        assert_eq!(coinbase.outputs.len(), 1);
+        assert_eq!(coinbase.outputs[0].amount, 50.0);
+        assert!(coinbase.verify_signatures());
     }
 
     #[test]
-    fn test_tampered_transaction() {
-        let wallet = Wallet::new();
-        let receiver = "some_receiver_key".to_string();
-        let mut tx = Transaction::new(wallet.get_public_key(), receiver, 10.0, &wallet);
-
-        // 🚨 ATTACK: Change amount AFTER signing
-        tx.amount = 1000.0; 
-
-        assert!(!tx.verify(), "Tampered transaction should fail verification");
+    fn test_block_reward_halving() {
+        assert_eq!(block_reward(0), 50.0);
+        assert_eq!(block_reward(999), 50.0);
+        assert_eq!(block_reward(1000), 25.0);
+        assert_eq!(block_reward(2000), 12.5);
+        assert_eq!(block_reward(3000), 6.25);
     }
 
     #[test]
-    fn test_signature_forgery() {
-        let alice_wallet = Wallet::new();
-        let eve_wallet = Wallet::new(); // Attacker
+    fn test_regular_transaction_with_change() {
+        let alice = Wallet::new();
+        let bob = Wallet::new();
 
-        // Eve tries to create a transaction "From Alice"
-        let receiver = "bob_key".to_string();
-        
-        let mut tx = Transaction {
-            sender: alice_wallet.get_public_key(), // Claiming to be Alice
-            receiver,
-            amount: 100.0,
-            signature: String::new(),
-            timestamp: 12345,
-        };
+        // Simulate Alice having a 50-coin UTXO with txid "aaa"
+        let utxo_inputs = vec![("aaa".to_string(), 0, 50.0)];
+        let tx = Transaction::new(utxo_inputs, &bob.get_public_key(), 30.0, &alice);
 
-        // Eve signs it with HER key
-        tx.signature = tx.sign(&eve_wallet);
+        // Should have 2 outputs: 30 to Bob, 20 change to Alice
+        assert_eq!(tx.outputs.len(), 2);
+        assert_eq!(tx.outputs[0].amount, 30.0);
+        assert_eq!(tx.outputs[0].recipient, bob.get_public_key());
+        assert_eq!(tx.outputs[1].amount, 20.0);
+        assert_eq!(tx.outputs[1].recipient, alice.get_public_key());
 
-        assert!(!tx.verify(), "forged signature should fail verification");
+        // Signatures should verify
+        assert!(tx.verify_signatures());
+    }
+
+    #[test]
+    fn test_tampered_transaction_fails() {
+        let alice = Wallet::new();
+        let bob = Wallet::new();
+
+        let utxo_inputs = vec![("aaa".to_string(), 0, 50.0)];
+        let mut tx = Transaction::new(utxo_inputs, &bob.get_public_key(), 30.0, &alice);
+
+        // Tamper: change the amount after signing
+        tx.outputs[0].amount = 1000.0;
+
+        // Re-compute the id (attacker would need to)
+        tx.id = tx.calculate_hash();
+
+        // Signatures should now fail (signed with original id)
+        assert!(!tx.verify_signatures());
+    }
+
+    #[test]
+    fn test_forged_signature_fails() {
+        let alice = Wallet::new();
+        let eve = Wallet::new();
+        let bob = Wallet::new();
+
+        // Eve tries to spend Alice's UTXO
+        let utxo_inputs = vec![("aaa".to_string(), 0, 50.0)];
+        let mut tx = Transaction::new(utxo_inputs, &bob.get_public_key(), 50.0, &eve);
+
+        // Eve signs with her key, but claims Alice's pubkey
+        tx.inputs[0].pub_key = alice.get_public_key();
+
+        // Should fail: eve's signature doesn't match alice's pubkey
+        assert!(!tx.verify_signatures());
     }
 }
