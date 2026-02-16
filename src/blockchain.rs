@@ -22,28 +22,55 @@ pub enum AddBlockResult {
 /// and which output index within that transaction.
 pub type UtxoKey = (String, u32);
 
+#[derive(Serialize, Deserialize)]
 pub struct Blockchain {
     pub chain: Vec<Block>,
     pub mempool: Vec<Transaction>,
+    #[serde(skip)]
     pub pending_blocks: HashMap<u32, Block>,
+    #[serde(skip)]
     pub utxo_set: HashMap<UtxoKey, TxOutput>,
+    #[serde(skip)]
+    pub file_path: String,
 }
 
 impl Blockchain {
-    pub fn new() -> Self {
+    pub fn new(file_path: &str) -> Self {
+        if let Ok(loaded) = Self::load_chain(file_path) {
+            println!("📂 Blockchain loaded from {} (Height: {})", file_path, loaded.chain.len() - 1);
+            return loaded;
+        }
+
+        println!("⚠️  No blockchain found at {}. Creating Genesis...", file_path);
         let mut blockchain = Blockchain {
             chain: Vec::new(),
             mempool: Vec::new(),
             pending_blocks: HashMap::new(),
             utxo_set: HashMap::new(),
+            file_path: file_path.to_string(),
         };
 
-        println!("Creating Genesis Block...");
         let genesis = Block::genesis();
         blockchain.chain.push(genesis);
-        // Genesis has no transactions → nothing to add to UTXO set
-
+        // Save genesis immediately
+        blockchain.save_chain();
         blockchain
+    }
+
+    pub fn save_chain(&self) {
+        let file = std::fs::File::create(&self.file_path).expect("Could not create chain file");
+        serde_json::to_writer(file, &self).expect("Could not save chain");
+    }
+
+    pub fn load_chain(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let file = std::fs::File::open(path)?;
+        let mut blockchain: Blockchain = serde_json::from_reader(file)?;
+        blockchain.file_path = path.to_string();
+        blockchain.pending_blocks = HashMap::new();
+        blockchain.utxo_set = HashMap::new();
+        // Rebuild UTXO set from scratch to ensure consistency
+        blockchain.rebuild_utxo_set();
+        Ok(blockchain)
     }
 
     // ─── UTXO Methods ─────────────────────────────────────────────────────
@@ -173,6 +200,7 @@ impl Blockchain {
         self.apply_block(&block);
         self.chain.push(block);
         self.remove_mined_transactions(&transactions);
+        self.save_chain();
     }
 
     pub fn add_to_mempool(&mut self, transaction: Transaction) -> bool {
@@ -292,6 +320,7 @@ impl Blockchain {
         self.chain = new_chain;
         // Rebuild UTXO set from scratch after chain replacement
         self.rebuild_utxo_set();
+        self.save_chain();
         true
     }
 
@@ -341,6 +370,7 @@ impl Blockchain {
             self.apply_block(&block);
             self.chain.push(block.clone());
             self.remove_mined_transactions(&block.transactions);
+            self.save_chain();
             self.drain_pending();
             return AddBlockResult::Added;
         }

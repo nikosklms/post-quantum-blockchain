@@ -18,11 +18,45 @@ use tokio::time::{interval, Duration};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize blockchain
-    let mut blockchain = Blockchain::new();
+    // Parse CLI arguments
+    let args: Vec<String> = std::env::args().collect();
+    
+    // Default data directory is current directory
+    let mut data_dir = std::path::PathBuf::from(".");
 
-    // Create a new wallet (persistence removed for now)
-    let wallet = Wallet::new();
+    // Check for --datadir
+    if let Some(idx) = args.iter().position(|r| r == "--datadir") {
+        if idx + 1 < args.len() {
+            data_dir = std::path::PathBuf::from(&args[idx + 1]);
+        }
+    }
+    
+    // Create data directory if it doesn't exist
+    if data_dir != std::path::PathBuf::from(".") {
+        std::fs::create_dir_all(&data_dir)?;
+    }
+    
+    // Default file paths within data directory
+    let mut wallet_path = data_dir.join("wallet.json");
+    let mut chain_path = data_dir.join("blockchain_data.json");
+    
+    // Allow overrides via --wallet and --chain flags
+    if let Some(idx) = args.iter().position(|r| r == "--wallet") {
+        if idx + 1 < args.len() {
+            wallet_path = std::path::PathBuf::from(&args[idx + 1]);
+        }
+    }
+    if let Some(idx) = args.iter().position(|r| r == "--chain") {
+        if idx + 1 < args.len() {
+            chain_path = std::path::PathBuf::from(&args[idx + 1]);
+        }
+    }
+
+    // Initialize blockchain
+    let mut blockchain = Blockchain::new(chain_path.to_str().unwrap());
+
+    // Load or create wallet
+    let wallet = Wallet::new_from_file(wallet_path.to_str().unwrap());
     
     let public_key = wallet.get_public_key();
     println!("Public Key: {}", public_key);
