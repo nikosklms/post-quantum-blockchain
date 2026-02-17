@@ -37,11 +37,18 @@ pub struct Blockchain {
 impl Blockchain {
     pub fn new(file_path: &str) -> Self {
         if let Ok(loaded) = Self::load_chain(file_path) {
-            println!("📂 Blockchain loaded from {} (Height: {})", file_path, loaded.chain.len() - 1);
+            println!(
+                "📂 Blockchain loaded from {} (Height: {})",
+                file_path,
+                loaded.chain.len() - 1
+            );
             return loaded;
         }
 
-        println!("⚠️  No blockchain found at {}. Creating Genesis...", file_path);
+        println!(
+            "⚠️  No blockchain found at {}. Creating Genesis...",
+            file_path
+        );
         let mut blockchain = Blockchain {
             chain: Vec::new(),
             mempool: Vec::new(),
@@ -81,14 +88,13 @@ impl Blockchain {
         for tx in &block.transactions {
             // Remove spent UTXOs (skip for coinbase — no inputs)
             for input in &tx.inputs {
-                self.utxo_set.remove(&(input.txid.clone(), input.output_index));
+                self.utxo_set
+                    .remove(&(input.txid.clone(), input.output_index));
             }
             // Add new UTXOs
             for (i, output) in tx.outputs.iter().enumerate() {
-                self.utxo_set.insert(
-                    (tx.id.clone(), i as u32),
-                    output.clone(),
-                );
+                self.utxo_set
+                    .insert((tx.id.clone(), i as u32), output.clone());
             }
         }
     }
@@ -104,7 +110,11 @@ impl Blockchain {
 
     /// Find spendable UTXOs for a given public key, up to the requested amount.
     /// Returns (Vec of (txid, output_index, amount), total accumulated).
-    pub fn find_spendable_outputs(&self, pub_key: &str, amount: f64) -> (Vec<(String, u32, f64)>, f64) {
+    pub fn find_spendable_outputs(
+        &self,
+        pub_key: &str,
+        amount: f64,
+    ) -> (Vec<(String, u32, f64)>, f64) {
         let mut accumulated = 0.0;
         let mut unspent: Vec<(String, u32, f64)> = Vec::new();
 
@@ -129,11 +139,19 @@ impl Blockchain {
 
         // Size limits
         if tx.inputs.len() > MAX_INPUTS_PER_TX {
-            println!("Transaction rejected: {} inputs exceeds max {}", tx.inputs.len(), MAX_INPUTS_PER_TX);
+            println!(
+                "Transaction rejected: {} inputs exceeds max {}",
+                tx.inputs.len(),
+                MAX_INPUTS_PER_TX
+            );
             return false;
         }
         if tx.outputs.len() > MAX_OUTPUTS_PER_TX {
-            println!("Transaction rejected: {} outputs exceeds max {}", tx.outputs.len(), MAX_OUTPUTS_PER_TX);
+            println!(
+                "Transaction rejected: {} outputs exceeds max {}",
+                tx.outputs.len(),
+                MAX_OUTPUTS_PER_TX
+            );
             return false;
         }
 
@@ -142,7 +160,10 @@ impl Blockchain {
             let max_reward = block_reward(block_height);
             let total_output: f64 = tx.outputs.iter().map(|o| o.amount).sum();
             if total_output > max_reward {
-                println!("Coinbase rejected: output {} exceeds reward {}", total_output, max_reward);
+                println!(
+                    "Coinbase rejected: output {} exceeds reward {}",
+                    total_output, max_reward
+                );
                 return false;
             }
             return true;
@@ -169,7 +190,10 @@ impl Blockchain {
                     input_total += utxo.amount;
                 }
                 None => {
-                    println!("Transaction rejected: UTXO ({}, {}) not found", input.txid, input.output_index);
+                    println!(
+                        "Transaction rejected: UTXO ({}, {}) not found",
+                        input.txid, input.output_index
+                    );
                     return false;
                 }
             }
@@ -178,7 +202,10 @@ impl Blockchain {
         // 3. Check inputs ≥ outputs (can't create money)
         let output_total: f64 = tx.outputs.iter().map(|o| o.amount).sum();
         if output_total > input_total {
-            println!("Transaction rejected: outputs ({}) exceed inputs ({})", output_total, input_total);
+            println!(
+                "Transaction rejected: outputs ({}) exceed inputs ({})",
+                output_total, input_total
+            );
             return false;
         }
 
@@ -229,6 +256,25 @@ impl Blockchain {
             return false;
         }
 
+        // Check for Double Spend in Mempool
+        // We must ensure that none of the inputs in `transaction` are already spent
+        // by any other transaction currently in the mempool.
+        for mem_tx in &self.mempool {
+            for mem_input in &mem_tx.inputs {
+                for new_input in &transaction.inputs {
+                    if mem_input.txid == new_input.txid
+                        && mem_input.output_index == new_input.output_index
+                    {
+                        println!(
+                            "Transaction rejected: Input ({}, {}) already spent in mempool by {}",
+                            new_input.txid, new_input.output_index, mem_tx.id
+                        );
+                        return false;
+                    }
+                }
+            }
+        }
+
         self.mempool.push(transaction);
         true
     }
@@ -239,33 +285,31 @@ impl Blockchain {
         if chain.len() % DIFFICULTY_ADJUSTMENT_INTERVAL as usize != 0 {
             return last_block.difficulty;
         }
-        let first_block = chain.iter()
-                                .rev()
-                                .nth(DIFFICULTY_ADJUSTMENT_INTERVAL as usize - 1)
-                                .unwrap();
+        let first_block = chain
+            .iter()
+            .rev()
+            .nth(DIFFICULTY_ADJUSTMENT_INTERVAL as usize - 1)
+            .unwrap();
         let ts_new = last_block.timestamp;
         let ts_first = first_block.timestamp;
         let mut new_difficulty = last_block.difficulty;
-        if (ts_new - ts_first) / 1000 > 
-            ((DIFFICULTY_ADJUSTMENT_INTERVAL * TARGET_BLOCK_TIME) * 2).into() {
-            
+        if (ts_new - ts_first) / 1000
+            > ((DIFFICULTY_ADJUSTMENT_INTERVAL * TARGET_BLOCK_TIME) * 2).into()
+        {
             if new_difficulty > 1 {
                 new_difficulty -= 1;
             }
-                    
-        } else if (ts_new - ts_first) / 1000 < 
-            ((DIFFICULTY_ADJUSTMENT_INTERVAL * TARGET_BLOCK_TIME) / 2).into() {
-            
+        } else if (ts_new - ts_first) / 1000
+            < ((DIFFICULTY_ADJUSTMENT_INTERVAL * TARGET_BLOCK_TIME) / 2).into()
+        {
             new_difficulty += 1;
-                    
         }
         new_difficulty
     }
 
     fn remove_mined_transactions(&mut self, mined_txs: &[Transaction]) {
-        self.mempool.retain(|tx| {
-            !mined_txs.iter().any(|mined| mined.id == tx.id)
-        });
+        self.mempool
+            .retain(|tx| !mined_txs.iter().any(|mined| mined.id == tx.id));
     }
 
     pub fn validate_chain(&self) -> bool {
@@ -290,14 +334,20 @@ impl Blockchain {
             }
 
             if current.previous_hash != previous.hash {
-                println!("Block {} is not linked to the previous block!", current.index);
+                println!(
+                    "Block {} is not linked to the previous block!",
+                    current.index
+                );
                 return false;
             }
 
             // Verify all transaction signatures
             for (t_idx, tx) in current.transactions.iter().enumerate() {
                 if !tx.verify_signatures() {
-                    println!("Block {} contains invalid transaction (index {})", current.index, t_idx);
+                    println!(
+                        "Block {} contains invalid transaction (index {})",
+                        current.index, t_idx
+                    );
                     return false;
                 }
             }
@@ -316,7 +366,10 @@ impl Blockchain {
             return false;
         }
 
-        println!("Replacing current chain with new longer chain (len {})", new_chain.len());
+        println!(
+            "Replacing current chain with new longer chain (len {})",
+            new_chain.len()
+        );
         self.chain = new_chain;
         // Rebuild UTXO set from scratch after chain replacement
         self.rebuild_utxo_set();
@@ -331,19 +384,16 @@ impl Blockchain {
         for block in &self.chain {
             for tx in &block.transactions {
                 for input in &tx.inputs {
-                    self.utxo_set.remove(&(input.txid.clone(), input.output_index));
+                    self.utxo_set
+                        .remove(&(input.txid.clone(), input.output_index));
                 }
                 for (i, output) in tx.outputs.iter().enumerate() {
-                    self.utxo_set.insert(
-                        (tx.id.clone(), i as u32),
-                        output.clone(),
-                    );
+                    self.utxo_set
+                        .insert((tx.id.clone(), i as u32), output.clone());
                 }
             }
         }
     }
-
-
 
     /// Try to add a single block received from the network
     pub fn try_add_block(&mut self, block: Block) -> AddBlockResult {
@@ -363,8 +413,12 @@ impl Blockchain {
             // Check block size
             let block_bytes = serde_json::to_vec(&block).unwrap_or_default();
             if block_bytes.len() > crate::block::MAX_BLOCK_SIZE {
-                println!("Rejected block {}: size {} exceeds max {}",
-                    block.index, block_bytes.len(), crate::block::MAX_BLOCK_SIZE);
+                println!(
+                    "Rejected block {}: size {} exceeds max {}",
+                    block.index,
+                    block_bytes.len(),
+                    crate::block::MAX_BLOCK_SIZE
+                );
                 return AddBlockResult::Invalid;
             }
             self.apply_block(&block);
@@ -378,7 +432,10 @@ impl Blockchain {
         // Future block (gap) -> buffer it
         if block.index > tip.index + 1 {
             if !self.pending_blocks.contains_key(&block.index) {
-                println!("📦 Buffering future block {} (tip is {})", block.index, tip.index);
+                println!(
+                    "📦 Buffering future block {} (tip is {})",
+                    block.index, tip.index
+                );
                 self.pending_blocks.insert(block.index, block);
                 return AddBlockResult::Buffered;
             }
@@ -387,14 +444,15 @@ impl Blockchain {
 
         // Fork or Orphan: block.index == tip.index + 1 BUT wrong parent
         if block.index == tip.index + 1 && block.previous_hash != tip.hash {
-            println!("⚠️  Orphan Block {} detected (prev: {}). Requesting parent...", 
-                block.index, 
+            println!(
+                "⚠️  Orphan Block {} detected (prev: {}). Requesting parent...",
+                block.index,
                 &block.previous_hash[..8]
             );
             // Buffet it so when parent arrives, we can process it
             self.pending_blocks.insert(block.index, block);
             // Return request for the parent (index - 1)
-            return AddBlockResult::Orphan(tip.index); 
+            return AddBlockResult::Orphan(tip.index);
         }
 
         // Old/duplicate block
@@ -407,7 +465,7 @@ impl Blockchain {
         for block in blocks {
             match self.try_add_block(block) {
                 AddBlockResult::Added => added += 1,
-                AddBlockResult::Buffered => {},
+                AddBlockResult::Buffered => {}
                 _ => {}
             }
         }
@@ -452,8 +510,9 @@ mod tests {
     use crate::wallet::Wallet;
 
     /// Helper: build a valid chain of `n` blocks on top of genesis.
-    fn build_valid_chain(n: u32) -> Vec<Block> {
-        let mut bc = Blockchain::new();
+    fn build_valid_chain(n: u32, filename: &str) -> Vec<Block> {
+        let _ = std::fs::remove_file(filename);
+        let mut bc = Blockchain::new(filename);
         for _ in 0..n {
             bc.add_block(vec![]);
         }
@@ -464,12 +523,23 @@ mod tests {
 
     #[test]
     fn test_out_of_order_blocks_get_buffered_then_linked() {
-        let blocks = build_valid_chain(5);
-        let mut bc = Blockchain::new();
+        let filename = "test_chain_ooo.json";
+        let _ = std::fs::remove_file(filename);
+        let blocks = build_valid_chain(5, "test_chain_helper_ooo.json");
+        let mut bc = Blockchain::new(filename);
 
-        assert_eq!(bc.try_add_block(blocks[2].clone()), AddBlockResult::Buffered);
-        assert_eq!(bc.try_add_block(blocks[3].clone()), AddBlockResult::Buffered);
-        assert_eq!(bc.try_add_block(blocks[4].clone()), AddBlockResult::Buffered);
+        assert_eq!(
+            bc.try_add_block(blocks[2].clone()),
+            AddBlockResult::Buffered
+        );
+        assert_eq!(
+            bc.try_add_block(blocks[3].clone()),
+            AddBlockResult::Buffered
+        );
+        assert_eq!(
+            bc.try_add_block(blocks[4].clone()),
+            AddBlockResult::Buffered
+        );
         assert_eq!(bc.chain.len(), 1);
         assert_eq!(bc.pending_blocks.len(), 3);
 
@@ -480,24 +550,34 @@ mod tests {
         assert_eq!(bc.chain.len(), 6);
         assert_eq!(bc.pending_blocks.len(), 0);
         assert!(bc.validate_chain());
+
+        let _ = std::fs::remove_file(filename);
+        let _ = std::fs::remove_file("test_chain_helper_ooo.json");
     }
 
     #[test]
     fn test_in_order_batch_adds_immediately() {
-        let blocks = build_valid_chain(5);
-        let mut bc = Blockchain::new();
+        let filename = "test_chain_batch.json";
+        let _ = std::fs::remove_file(filename);
+        let blocks = build_valid_chain(5, "test_chain_helper_batch.json");
+        let mut bc = Blockchain::new(filename);
 
         let added = bc.try_add_block_batch(blocks);
         assert_eq!(added, 5);
         assert_eq!(bc.chain.len(), 6);
         assert_eq!(bc.pending_blocks.len(), 0);
         assert!(bc.validate_chain());
+
+        let _ = std::fs::remove_file(filename);
+        let _ = std::fs::remove_file("test_chain_helper_batch.json");
     }
 
     #[test]
     fn test_parallel_download_two_peers() {
-        let blocks = build_valid_chain(6);
-        let mut bc = Blockchain::new();
+        let filename = "test_chain_parallel.json";
+        let _ = std::fs::remove_file(filename);
+        let blocks = build_valid_chain(6, "test_chain_helper_parallel.json");
+        let mut bc = Blockchain::new(filename);
 
         let added_b = bc.try_add_block_batch(blocks[3..6].to_vec());
         assert_eq!(added_b, 0);
@@ -508,22 +588,32 @@ mod tests {
         assert_eq!(bc.chain.len(), 7);
         assert_eq!(bc.pending_blocks.len(), 0);
         assert!(bc.validate_chain());
+
+        let _ = std::fs::remove_file(filename);
+        let _ = std::fs::remove_file("test_chain_helper_parallel.json");
     }
 
     #[test]
     fn test_duplicate_blocks_rejected() {
-        let blocks = build_valid_chain(3);
-        let mut bc = Blockchain::new();
+        let filename = "test_chain_dup.json";
+        let _ = std::fs::remove_file(filename);
+        let blocks = build_valid_chain(3, "test_chain_helper_dup.json");
+        let mut bc = Blockchain::new(filename);
 
         assert_eq!(bc.try_add_block(blocks[0].clone()), AddBlockResult::Added);
         assert_eq!(bc.try_add_block(blocks[0].clone()), AddBlockResult::Exists);
         assert_eq!(bc.chain.len(), 2);
+
+        let _ = std::fs::remove_file(filename);
+        let _ = std::fs::remove_file("test_chain_helper_dup.json");
     }
 
     #[test]
     fn test_three_peer_parallel_interleaved() {
-        let blocks = build_valid_chain(9);
-        let mut bc = Blockchain::new();
+        let filename = "test_chain_interleaved.json";
+        let _ = std::fs::remove_file(filename);
+        let blocks = build_valid_chain(9, "test_chain_helper_interleaved.json");
+        let mut bc = Blockchain::new(filename);
 
         bc.try_add_block_batch(blocks[6..9].to_vec());
         assert_eq!(bc.chain.len(), 1);
@@ -536,13 +626,18 @@ mod tests {
         assert_eq!(bc.chain.len(), 10);
         assert_eq!(bc.pending_blocks.len(), 0);
         assert!(bc.validate_chain());
+
+        let _ = std::fs::remove_file(filename);
+        let _ = std::fs::remove_file("test_chain_helper_interleaved.json");
     }
 
     // ── UTXO Tests ───────────────────────────────────────────────────────
 
     #[test]
     fn test_coinbase_creates_utxo() {
-        let mut bc = Blockchain::new();
+        let filename = "test_chain_utxo.json";
+        let _ = std::fs::remove_file(filename);
+        let mut bc = Blockchain::new(filename);
         let miner = Wallet::new();
 
         let coinbase = Transaction::new_coinbase(&miner.get_public_key(), 1);
@@ -550,11 +645,15 @@ mod tests {
 
         assert_eq!(bc.get_balance(&miner.get_public_key()), 50.0);
         assert_eq!(bc.utxo_set.len(), 1);
+
+        let _ = std::fs::remove_file(filename);
     }
 
     #[test]
     fn test_spend_and_change() {
-        let mut bc = Blockchain::new();
+        let filename = "test_chain_spend.json";
+        let _ = std::fs::remove_file(filename);
+        let mut bc = Blockchain::new(filename);
         let alice = Wallet::new();
         let bob = Wallet::new();
 
@@ -570,11 +669,15 @@ mod tests {
 
         assert_eq!(bc.get_balance(&alice.get_public_key()), 20.0);
         assert_eq!(bc.get_balance(&bob.get_public_key()), 30.0);
+
+        let _ = std::fs::remove_file(filename);
     }
 
     #[test]
     fn test_double_spend_rejected() {
-        let mut bc = Blockchain::new();
+        let filename = "test_chain_ds.json";
+        let _ = std::fs::remove_file(filename);
+        let mut bc = Blockchain::new(filename);
         let alice = Wallet::new();
         let bob = Wallet::new();
 
@@ -589,18 +692,59 @@ mod tests {
 
         // Alice tries to spend the SAME UTXO again (double spend!)
         let tx2 = Transaction::new(inputs, &bob.get_public_key(), 50.0, &alice);
-        assert!(!bc.validate_transaction(&tx2, 3), "Double spend should be rejected");
+        assert!(
+            !bc.validate_transaction(&tx2, 3),
+            "Double spend should be rejected"
+        );
+
+        let _ = std::fs::remove_file(filename);
     }
 
     #[test]
     fn test_insufficient_balance_rejected() {
-        let mut bc = Blockchain::new();
+        let filename = "test_chain_balance.json";
+        let _ = std::fs::remove_file(filename);
+        let mut bc = Blockchain::new(filename);
         let alice = Wallet::new();
-        let bob = Wallet::new();
 
         // Alice has 0 balance — no coinbase
         let (inputs, total) = bc.find_spendable_outputs(&alice.get_public_key(), 100.0);
         assert_eq!(total, 0.0);
         assert!(inputs.is_empty(), "Should find no UTXOs");
+
+        let _ = std::fs::remove_file(filename);
+    }
+    #[test]
+    fn test_mempool_double_spend_rejected() {
+        let filename = "test_chain_mempool_ds.json";
+        let _ = std::fs::remove_file(filename);
+        let mut bc = Blockchain::new(filename);
+        let alice = Wallet::new();
+        let bob = Wallet::new();
+        let charlie = Wallet::new();
+
+        // 1. Mine coins for Alice
+        let coinbase = Transaction::new_coinbase(&alice.get_public_key(), 1);
+        bc.add_block(vec![coinbase]);
+
+        // 2. Create TX1: Alice -> Bob
+        let (inputs, _) = bc.find_spendable_outputs(&alice.get_public_key(), 50.0);
+        let tx1 = Transaction::new(inputs.clone(), &bob.get_public_key(), 50.0, &alice);
+
+        // 3. Create TX2: Alice -> Charlie (USING SAME INPUTS)
+        let tx2 = Transaction::new(inputs, &charlie.get_public_key(), 50.0, &alice);
+
+        // 4. Add to mempool
+        assert!(bc.add_to_mempool(tx1), "First TX should be accepted");
+
+        // 5. THIS SHOULD FAIL (currently passes = valid bug)
+        // If it returns TRUE, then assert!(!...) fails, meaning "Double spend NOT rejected".
+        // If it returns FALSE, then assert!(!...) passes, meaning "Double spend rejected".
+        assert!(
+            !bc.add_to_mempool(tx2),
+            "Second TX (double spend) should be REJECTED"
+        );
+
+        let _ = std::fs::remove_file(filename);
     }
 }

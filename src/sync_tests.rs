@@ -179,4 +179,26 @@ mod sync_tests {
             assert!(count <= 400, "No peer should have more than 400 blocks (got {})", count);
         }
     }
+
+    #[test]
+    fn test_partial_sync_skips_known_blocks() {
+        let mut sm = SyncManager::new();
+        let peers = fake_peers(1);
+        let peer = peers[0];
+
+        // Scenario: 
+        // My Height: 100 (I have blocks 0-100)
+        // Peer Height: 105 (Peer has 0-105)
+        // Expected: Request blocks 101-105.
+        // NOT 0-105.
+
+        sm.record_peer_height(peer, 105, 100);
+        let assignments = sm.plan_assignments(100);
+
+        assert_eq!(assignments.len(), 1, "Should generate exactly 1 request chunk");
+        let (p, start, end) = assignments[0];
+        assert_eq!(p, peer);
+        assert_eq!(start, 101, "Should start requesting from 101 (my_height + 1)");
+        assert_eq!(end, 105, "Should end at peer height");
+    }
 }
