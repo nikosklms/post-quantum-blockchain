@@ -543,6 +543,7 @@ impl Blockchain {
 
     /// Drain pending_blocks that can now link to the chain tip
     fn drain_pending(&mut self) {
+        let mut added = false;
         loop {
             let next_idx = self.chain.last().unwrap().index + 1;
             if let Some(block) = self.pending_blocks.remove(&next_idx) {
@@ -552,6 +553,7 @@ impl Blockchain {
                     self.apply_block(&block);
                     self.chain.push(block.clone());
                     self.remove_mined_transactions(&block.transactions);
+                    added = true;
                 } else {
                     println!("Buffered block {} invalid, discarding.", next_idx);
                     break;
@@ -559,6 +561,10 @@ impl Blockchain {
             } else {
                 break;
             }
+        }
+        
+        if added {
+            self.save_chain();
         }
     }
 }
