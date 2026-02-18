@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::time::{SystemTime, UNIX_EPOCH};
+use num_bigint::BigUint;
+use num_traits::Num;
 
 use crate::transaction::Transaction;
 
-pub const MAX_BLOCK_SIZE: usize = 1_000_000; // 1 MB max block size (serialized bytes)
+pub const MAX_BLOCK_SIZE: usize = 4_000_000; // 4 MB max block size (Falcon signatures are larger)
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
@@ -15,12 +17,12 @@ pub struct Block {
     pub transactions: Vec<Transaction>,
     pub merkle_root: String,
     pub hash: String,
-    pub difficulty: usize,
+    pub difficulty: String, // Target as Hex String
 }
 
 impl Block {
     pub fn new(index: u32, transactions: Vec<Transaction>, previous_hash: String, 
-            difficulty: usize) -> Self {
+            difficulty: String) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
@@ -45,6 +47,12 @@ impl Block {
     }
 
     pub fn genesis() -> Self {
+        // Initial Target: Start with 4 leading zeros (approx)
+        // Max hash is 2^256. 
+        // 0x0000FFFFFFFF... indicates we need ~16 bits of zeros (easy for testing)
+        // A full "0000" prefix in hex is 16 bits.
+        let initial_target = "0000ffff00000000000000000000000000000000000000000000000000000000".to_string();
+
         let mut block = Block {
             index: 0,
             timestamp: 0,
@@ -53,7 +61,7 @@ impl Block {
             transactions: vec![],
             merkle_root: String::new(),
             hash: String::new(),
-            difficulty: 3,
+            difficulty: initial_target,
         };
         block.merkle_root = Self::calculate_merkle_root(&block.transactions);
         // Create a dummy "false" signal for genesis (never cancel)
@@ -113,19 +121,50 @@ impl Block {
     }
 
     pub fn mine_block(&mut self, stop_signal: &std::sync::atomic::AtomicBool) {
-        let target = "0".repeat(self.difficulty);
+        let target = BigUint::from_str_radix(&self.difficulty, 16)
+            .expect("Invalid difficulty target");
+        
         use std::sync::atomic::Ordering;
 
-        while !self.hash.starts_with(&target) {
+        loop {
             // Check if we should stop
             if stop_signal.load(Ordering::Relaxed) {
                 println!("🛑 Mining cancelled!");
                 return;
             }
 
-            self.nonce += 1;
             self.hash = self.calculate_hash();
+            
+            // Convert hash to BigUint for comparison
+            // We need to parse it as hex
+            if let Ok(hash_val) = BigUint::from_str_radix(&self.hash, 16) {
+                if hash_val < target {
+                    println!("⛏️  Block Mined: {}", self.hash);
+                    return;
+                }
+            }
+            
+            self.nonce += 1;
         }
-        println!("⛏️  Block Mined: {}", self.hash);
+    }
+    
+    // Check if the block satisfies its own difficulty target
+    pub fn is_valid(&self, expected_difficulty: &str) -> bool {
+        // 1. Difficulty in block must match expected difficulty
+        if self.difficulty != expected_difficulty {
+            println!("Invalid difficulty target. Expected {}, got {}", expected_difficulty, self.difficulty);
+            return false;
+        }
+        
+        let target = BigUint::from_str_radix(&self.difficulty, 16).unwrap_or_default();
+        let hash_val = BigUint::from_str_radix(&self.hash, 16).unwrap_or_default();
+        
+        // 2. Hash must be less than target
+        if hash_val >= target {
+             println!("Hash too high! {} >= {}", hash_val, target);
+             return false;
+        }
+        
+        true
     }
 }

@@ -79,7 +79,7 @@ pub struct SyncManager {
     /// Heights reported by peers via ChainParams
     pub peer_heights: HashMap<PeerId, u32>,
     /// Global work queue: chunks (start, end) we still need to fetch
-    work_queue: VecDeque<(u32, u32)>,
+    pub work_queue: VecDeque<(u32, u32)>,
     /// Per-peer in-flight requests
     in_flight: HashMap<PeerId, Vec<InFlightRequest>>,
     /// Highest height we've generated work for (avoids duplicate chunks)
@@ -149,7 +149,7 @@ impl SyncManager {
         let assignments = self.plan_assignments(my_height);
         for (peer, s, e) in assignments {
             println!("  📡 Requesting blocks {}-{} from {}", s, e, peer);
-            let request = SyncRequest { start_height: s, end_height: e };
+            let request = SyncRequest { start_height: s, end_height: e, locators: None };
             swarm.behaviour_mut().direct_sync.send_request(&peer, request);
         }
     }
@@ -232,11 +232,13 @@ impl SyncManager {
     }
 
     /// Number of items remaining in the work queue
+    #[allow(dead_code)]
     pub fn work_queue_len(&self) -> usize {
         self.work_queue.len()
     }
 
     /// Number of in-flight requests for a specific peer
+    #[allow(dead_code)]
     pub fn in_flight_count(&self, peer: &PeerId) -> usize {
         self.in_flight.get(peer).map_or(0, |v| v.len())
     }
@@ -424,10 +426,21 @@ pub fn handle_swarm_event(
                     match message {
                         // INCOMING REQUEST: peer wants blocks from us
                         request_response::Message::Request { request, channel, .. } => {
-                            println!("📥 Sync request from {}: blocks {}-{}",
-                                     peer, request.start_height, request.end_height);
+                            println!("📥 Sync request from {}: blocks {}-{} (locators: {})",
+                                     peer, request.start_height, request.end_height, request.locators.is_some());
 
-                            let blocks: Vec<Block> = (request.start_height..=request.end_height)
+                            let start_height = if let Some(locators) = &request.locators {
+                                if let Some(ancestor) = blockchain.find_common_ancestor(locators) {
+                                     println!("🔱 Common ancestor found at {}", ancestor);
+                                     ancestor + 1
+                                } else {
+                                     request.start_height
+                                }
+                            } else {
+                                request.start_height
+                            };
+
+                            let blocks: Vec<Block> = (start_height..=request.end_height)
                                 .filter_map(|i| blockchain.chain.get(i as usize).cloned())
                                 .collect();
 
@@ -448,13 +461,37 @@ pub fn handle_swarm_event(
                                 println!("📥 Received {} blocks ({}-{}) from {}", count, first, last, peer);
                                 // Clear from in-flight
                                 sync_manager.on_response(&peer, first, last);
-                                let added = blockchain.try_add_block_batch(response.blocks);
+                                let (added, failure) = blockchain.try_add_block_batch(response.blocks);
+                                
                                 if added > 0 {
                                     println!("✅ Added {} blocks. Chain height: {}", added, blockchain.chain.len() - 1);
                                     if sync_manager.is_idle() {
                                         println!("🎉 Sync complete! Height: {}", blockchain.chain.last().unwrap().index);
                                     }
-                                    true // signal: chain changed, cancel mining
+                                }
+                                
+                                if let Some(fail) = failure {
+                                    match fail {
+                                        crate::blockchain::AddBlockResult::Orphan(parent_idx) => {
+                                            println!("🔍 Batch hit orphan at parent {}. Requesting from {}...", parent_idx, peer);
+                                            request_block(swarm, &peer, parent_idx);
+                                        }
+                                        crate::blockchain::AddBlockResult::Fork => {
+                                            println!("🔱 Batch detected fork from peer {}. Triggering reorg sync...", peer);
+                                            let locators = blockchain.create_locator_hashes();
+                                            let req = crate::sync::SyncRequest {
+                                                start_height: 0, 
+                                                end_height: last + 20, 
+                                                locators: Some(locators),
+                                            };
+                                            let _ = swarm.behaviour_mut().direct_sync.send_request(&peer, req);
+                                        }
+                                        _ => println!("⚠️ Batch processing stopped due to {:?}", fail),
+                                    }
+                                }
+                                
+                                if added > 0 {
+                                    true // signal: chain changed
                                 } else {
                                     false
                                 }
@@ -509,17 +546,41 @@ pub fn handle_swarm_event(
 
                         // New mined block (gossip broadcast)
                         Ok(NetworkMessage::Block { block, request_id: _ }) => {
+                            // Peer definitely has this block, so they are at least at this height
+                            let my_height = blockchain.chain.len() as u32;
+                            sync_manager.record_peer_height(peer_id, block.index, my_height);
+
                             match blockchain.try_add_block(block.clone()) {
                                 crate::blockchain::AddBlockResult::Added => {
                                     println!("\n⛏️  New block {} from peer {}", block.index, peer_id);
                                     println!("Chain height: {}", blockchain.chain.len() - 1);
                                     true
                                 }
-                                crate::blockchain::AddBlockResult::Buffered => false,
+                                crate::blockchain::AddBlockResult::Buffered => {
+                                    let my_height = blockchain.chain.len() as u32;
+                                    if block.index > my_height {
+                                        println!("📦 Buffered future block {}. Triggering priority sync for {}-{}...", 
+                                            block.index, my_height, block.index - 1);
+                                        // Force re-request of the missing gap
+                                        sync_manager.work_queue.push_front((my_height, block.index - 1));
+                                    }
+                                    false
+                                },
                                 crate::blockchain::AddBlockResult::Exists => false,
                                 crate::blockchain::AddBlockResult::Orphan(parent_idx) => {
                                     println!("🔍 Asking {} for parent block {}", peer_id, parent_idx);
                                     request_block(swarm, &peer_id, parent_idx);
+                                    false
+                                }
+                                crate::blockchain::AddBlockResult::Fork => {
+                                    println!("🔱 Fork detected from peer {}. Triggering reorg sync...", peer_id);
+                                    let locators = blockchain.create_locator_hashes();
+                                    let req = crate::sync::SyncRequest {
+                                        start_height: 0, 
+                                        end_height: block.index + 20, 
+                                        locators: Some(locators),
+                                    };
+                                    let _ = swarm.behaviour_mut().direct_sync.send_request(&peer_id, req);
                                     false
                                 }
                                 crate::blockchain::AddBlockResult::Invalid => {
@@ -596,7 +657,10 @@ pub fn handle_swarm_event(
             peer_tracker.add_peer(peer_id);
             false
         }
-        SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+        SwarmEvent::ConnectionClosed { peer_id, cause, num_established, .. } => {
+            if num_established > 0 {
+                return false;
+            }
             println!("Connection closed with {}: {:?}", peer_id, cause);
             peer_tracker.remove_peer(&peer_id);
             sync_manager.remove_peer(&peer_id);
@@ -634,7 +698,7 @@ pub fn request_block(
     peer: &PeerId,
     height: u32
 ) {
-    let request = SyncRequest { start_height: height, end_height: height };
+    let request = SyncRequest { start_height: height, end_height: height, locators: None };
     swarm.behaviour_mut().direct_sync.send_request(peer, request);
     println!("📡 Requesting orphan parent block {} from {}", height, peer);
 }

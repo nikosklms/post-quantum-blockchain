@@ -7,6 +7,9 @@ mod sync;
 #[cfg(test)]
 mod sync_tests;
 
+#[cfg(test)]
+mod debug_exploit;
+
 use transaction::Transaction;
 use blockchain::Blockchain;
 use wallet::Wallet;

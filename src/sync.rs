@@ -6,6 +6,7 @@ use crate::block::Block;
 pub struct SyncRequest {
     pub start_height: u32,
     pub end_height: u32,
+    pub locators: Option<Vec<String>>,
 }
 
 /// Direct sync response: a batch of blocks
