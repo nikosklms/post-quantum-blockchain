@@ -1,30 +1,19 @@
-# Simple P2P Blockchain in Rust
+# Post-Quantum Blockchain
 
-A basic Proof-of-Work blockchain implementation with peer-to-peer networking using `libp2p`.
+A quantum-resistant PoW blockchain implementation in Rust, featuring:
 
-## Features
-- **Proof of Work**: Mining with adjustable difficulty.
-- **P2P Networking**: Decentralized peer discovery via mDNS and GossipSub.
-- **Consensus**: Longest Chain Rule (Nakamoto Consensus).
-- **Sync**: Full chain synchronization to resolve forks.
+- **Post-Quantum Cryptography**: Uses **Falcon-512** signatures (via `fn-dsa`) for transaction security, resistant to Shor's algorithm.
+- **Nakamoto Consensus**: Longest Chain Rule with readjusting difficulty.
+- **P2P Networking (Local)**: Decentralized peer discovery via `libp2p`.
+- **Fork Resolution**: Robust chain reorganization to resolve forks and maintain consensus.
+- **UTXO Model**: Unspent Transaction Output model for tracking balances.
 
-## Getting Started
-
-### Prerequisites
-- Rust and Cargo installed.
+This is a complete **Full Node** implementation featuring **Quantum Resistance** by replacing standard ECDSA with **Falcon-512** signatures. It protects against future quantum computer attacks while providing a fully functional P2P node with wallet, mempool, and blockchain management.
 
 ### Running a Node
+To run a node (e.g., node1), specify its data directory:
 ```bash
-cargo run
+cargo run --release -- --datadir node1
 ```
+To run multiple nodes, open separate terminals and change the directory (e.g., `node2`, `node3`).
 
-### Commands
-- `trans <receiver> <amount>`: Broadcast a transaction to the network (does NOT mine).
-- `mine`: Mine a new block containing pending transactions from the mempool.
-- `mine_local <receiver> <amount>`: Mine a block **locally** (for testing conflicts).
-- `sync`: Broadcast your full chain to peers (triggers consensus).
-- `chain`: View the current blockchain.
-- `peers`: View connected peers.
-
-## Conflict Experiment
-See [conflict_experiment.md](conflict_experiment.md) for a guide on how to simulate and resolve a blockchain fork.
