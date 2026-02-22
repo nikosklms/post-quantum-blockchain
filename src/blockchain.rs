@@ -17,6 +17,7 @@ pub enum AddBlockResult {
     Orphan(u32), // Returns index of the missing parent
     Fork,        // Block is at existing height but different hash
     Invalid,
+    NeedsReorg,  // Chains have fully diverged; need full chain from peer
 }
 
 // ─── UTXO Key: (transaction_id, output_index) ────────────────────────────────
@@ -526,13 +527,15 @@ impl Blockchain {
                              println!("DEBUG: Reorg failed verification.");
                          }
                     } else {
-                        println!("DEBUG: Ancestor not found for reorg.");
+                        // Chains diverged below our current blocks — need full resync
+                        println!("DEBUG: Ancestor not found. Chains fully diverged. Need full reorg.");
+                        return (added, Some(AddBlockResult::NeedsReorg));
                     }
                     
-                    // If reorg failed or wasn't possible, return the error
+                    // If reorg failed, return the error
                     return (added, Some(res));
                 }
-                AddBlockResult::Invalid => {
+                AddBlockResult::Invalid | AddBlockResult::NeedsReorg => {
                     return (added, Some(res));
                 }
             }
@@ -542,7 +545,7 @@ impl Blockchain {
     }
 
     /// Drain pending_blocks that can now link to the chain tip
-    fn drain_pending(&mut self) {
+    pub(crate) fn drain_pending(&mut self) {
         let mut added = false;
         loop {
             let next_idx = self.chain.last().unwrap().index + 1;
@@ -579,288 +582,4 @@ impl std::fmt::Display for Blockchain {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::wallet::Wallet;
 
-    /// Helper: build a valid chain of `n` blocks on top of genesis.
-    fn build_valid_chain(n: u32, filename: &str) -> Vec<Block> {
-        let _ = std::fs::remove_file(filename);
-        let mut bc = Blockchain::new(filename);
-        for _ in 0..n {
-            bc.add_block(vec![]);
-        }
-        bc.chain.into_iter().skip(1).collect()
-    }
-
-    // ── Parallel Sync Tests ──────────────────────────────────────────────
-
-    #[test]
-    fn test_out_of_order_blocks_get_buffered_then_linked() {
-        let filename = "test_chain_ooo.json";
-        let _ = std::fs::remove_file(filename);
-        let blocks = build_valid_chain(5, "test_chain_helper_ooo.json");
-        let mut bc = Blockchain::new(filename);
-
-        assert_eq!(bc.try_add_block(blocks[2].clone()), AddBlockResult::Buffered);
-        assert_eq!(bc.try_add_block(blocks[3].clone()), AddBlockResult::Buffered);
-        assert_eq!(bc.try_add_block(blocks[4].clone()), AddBlockResult::Buffered);
-        assert_eq!(bc.chain.len(), 1);
-        assert_eq!(bc.pending_blocks.len(), 3);
-
-        assert_eq!(bc.try_add_block(blocks[0].clone()), AddBlockResult::Added);
-        assert_eq!(bc.chain.len(), 2);
-
-        assert_eq!(bc.try_add_block(blocks[1].clone()), AddBlockResult::Added);
-        assert_eq!(bc.chain.len(), 6);
-        assert_eq!(bc.pending_blocks.len(), 0);
-        assert!(bc.validate_chain());
-        
-        let _ = std::fs::remove_file(filename);
-        let _ = std::fs::remove_file("test_chain_helper_ooo.json");
-    }
-
-    #[test]
-    fn test_in_order_batch_adds_immediately() {
-        let filename = "test_chain_batch.json";
-        let _ = std::fs::remove_file(filename);
-        let blocks = build_valid_chain(5, "test_chain_helper_batch.json");
-        let mut bc = Blockchain::new(filename);
-
-        let (added, _) = bc.try_add_block_batch(blocks);
-        // Should add all 5 immediately
-        assert_eq!(added, 5);
-        assert_eq!(bc.chain.len(), 6);
-        assert_eq!(bc.pending_blocks.len(), 0);
-        assert!(bc.validate_chain());
-
-        let _ = std::fs::remove_file(filename);
-        let _ = std::fs::remove_file("test_chain_helper_batch.json");
-    }
-
-    #[test]
-    fn test_parallel_download_two_peers() {
-        let filename = "test_chain_parallel.json";
-        let _ = std::fs::remove_file(filename);
-        let blocks = build_valid_chain(6, "test_chain_helper_parallel.json");
-        let mut bc = Blockchain::new(filename);
-
-        let batch_b = blocks[3..6].to_vec(); // 3,4,5 (future -> buffered)
-        let (added_b, _) = bc.try_add_block_batch(batch_b);
-        assert_eq!(added_b, 0); // 0 added to chain, 3 buffered
-        assert_eq!(bc.pending_blocks.len(), 3);
-
-        let b0 = blocks[0].clone();
-        let b1 = blocks[1].clone();
-        let b2 = blocks[2].clone();
-        // Now process a batch from Peer 1 (suppose they send 0,1,2)
-        let peer1_batch = vec![b0.clone(), b1.clone(), b2.clone()];
-        let (added, _) = bc.try_add_block_batch(peer1_batch);
-        assert_eq!(added, 3);
-        assert_eq!(bc.chain.len(), 7);
-        assert_eq!(bc.pending_blocks.len(), 0);
-        assert!(bc.validate_chain());
-
-        let _ = std::fs::remove_file(filename);
-        let _ = std::fs::remove_file("test_chain_helper_parallel.json");
-    }
-
-    #[test]
-    fn test_duplicate_blocks_rejected() {
-        let filename = "test_chain_dup.json";
-        let _ = std::fs::remove_file(filename);
-        let blocks = build_valid_chain(3, "test_chain_helper_dup.json");
-        let mut bc = Blockchain::new(filename);
-
-        assert_eq!(bc.try_add_block(blocks[0].clone()), AddBlockResult::Added);
-        assert_eq!(bc.try_add_block(blocks[0].clone()), AddBlockResult::Exists);
-        assert_eq!(bc.chain.len(), 2);
-
-        let _ = std::fs::remove_file(filename);
-        let _ = std::fs::remove_file("test_chain_helper_dup.json");
-    }
-
-    #[test]
-    fn test_three_peer_parallel_interleaved() {
-        let filename = "test_chain_interleaved.json";
-        let _ = std::fs::remove_file(filename);
-        let blocks = build_valid_chain(9, "test_chain_helper_interleaved.json");
-        let mut bc = Blockchain::new(filename);
-
-        bc.try_add_block_batch(blocks[6..9].to_vec());
-        assert_eq!(bc.chain.len(), 1);
-
-        bc.try_add_block_batch(blocks[3..6].to_vec());
-        assert_eq!(bc.chain.len(), 1);
-
-        let (added, _) = bc.try_add_block_batch(blocks[0..3].to_vec());
-        assert_eq!(added, 3);
-        assert_eq!(bc.chain.len(), 10);
-        assert_eq!(bc.pending_blocks.len(), 0);
-        assert!(bc.validate_chain());
-
-        let _ = std::fs::remove_file(filename);
-        let _ = std::fs::remove_file("test_chain_helper_interleaved.json");
-    }
-
-    // ── UTXO Tests ───────────────────────────────────────────────────────
-
-    #[test]
-    fn test_coinbase_creates_utxo() {
-        let filename = "test_chain_utxo.json";
-        let _ = std::fs::remove_file(filename);
-        let mut bc = Blockchain::new(filename);
-        let miner = Wallet::new();
-
-        let coinbase = Transaction::new_coinbase(&miner.get_public_key(), 1);
-        bc.add_block(vec![coinbase]);
-
-        assert_eq!(bc.get_balance(&miner.get_public_key()), 50.0);
-        assert_eq!(bc.utxo_set.len(), 1);
-
-        let _ = std::fs::remove_file(filename);
-    }
-
-    #[test]
-    fn test_spend_and_change() {
-        let filename = "test_chain_spend.json";
-        let _ = std::fs::remove_file(filename);
-        let mut bc = Blockchain::new(filename);
-        let alice = Wallet::new();
-        let bob = Wallet::new();
-
-        // Mine a block to give Alice 50 coins
-        let coinbase = Transaction::new_coinbase(&alice.get_public_key(), 1);
-        bc.add_block(vec![coinbase]);
-        assert_eq!(bc.get_balance(&alice.get_public_key()), 50.0);
-
-        // Alice sends 30 to Bob
-        let (inputs, _total) = bc.find_spendable_outputs(&alice.get_public_key(), 30.0);
-        let tx = Transaction::new(inputs, &bob.get_public_key(), 30.0, &alice);
-        bc.add_block(vec![tx]);
-
-        assert_eq!(bc.get_balance(&alice.get_public_key()), 20.0);
-        assert_eq!(bc.get_balance(&bob.get_public_key()), 30.0);
-
-        let _ = std::fs::remove_file(filename);
-    }
-
-    #[test]
-    fn test_double_spend_rejected() {
-        let filename = "test_chain_ds.json";
-        let _ = std::fs::remove_file(filename);
-        let mut bc = Blockchain::new(filename);
-        let alice = Wallet::new();
-        let bob = Wallet::new();
-
-        // Mine a block to give Alice 50 coins
-        let coinbase = Transaction::new_coinbase(&alice.get_public_key(), 1);
-        bc.add_block(vec![coinbase]);
-
-        // Alice creates a valid transaction
-        let (inputs, _) = bc.find_spendable_outputs(&alice.get_public_key(), 50.0);
-        let tx = Transaction::new(inputs.clone(), &bob.get_public_key(), 50.0, &alice);
-        bc.add_block(vec![tx]);
-
-        // Alice tries to spend the SAME UTXO again (double spend!)
-        let tx2 = Transaction::new(inputs, &bob.get_public_key(), 50.0, &alice);
-        assert!(!bc.validate_transaction(&tx2, 3), "Double spend should be rejected");
-
-        let _ = std::fs::remove_file(filename);
-    }
-
-    #[test]
-    fn test_insufficient_balance_rejected() {
-        let filename = "test_chain_balance.json";
-        let _ = std::fs::remove_file(filename);
-        let mut bc = Blockchain::new(filename);
-        let alice = Wallet::new();
-
-        // Alice has 0 balance — no coinbase
-        let (inputs, total) = bc.find_spendable_outputs(&alice.get_public_key(), 100.0);
-        assert_eq!(total, 0.0);
-        assert!(inputs.is_empty(), "Should find no UTXOs");
-
-        let _ = std::fs::remove_file(filename);
-    }
-    #[test]
-    fn test_mempool_double_spend_rejected() {
-        let filename = "test_chain_mempool_ds.json";
-        let _ = std::fs::remove_file(filename);
-        let mut bc = Blockchain::new(filename);
-        let alice = Wallet::new();
-        let bob = Wallet::new();
-        let charlie = Wallet::new();
-
-        // 1. Mine coins for Alice
-        let coinbase = Transaction::new_coinbase(&alice.get_public_key(), 1);
-        bc.add_block(vec![coinbase]);
-
-        // 2. Create TX1: Alice -> Bob
-        let (inputs, _) = bc.find_spendable_outputs(&alice.get_public_key(), 50.0);
-        let tx1 = Transaction::new(inputs.clone(), &bob.get_public_key(), 50.0, &alice);
-        
-        // 3. Create TX2: Alice -> Charlie (USING SAME INPUTS)
-        let tx2 = Transaction::new(inputs, &charlie.get_public_key(), 50.0, &alice);
-
-        // 4. Add to mempool
-        assert!(bc.add_to_mempool(tx1), "First TX should be accepted");
-        
-        // 5. THIS SHOULD FAIL (currently passes = valid bug)
-        // If it returns TRUE, then assert!(!...) fails, meaning "Double spend NOT rejected".
-        // If it returns FALSE, then assert!(!...) passes, meaning "Double spend rejected".
-        assert!(!bc.add_to_mempool(tx2), "Second TX (double spend) should be REJECTED");
-
-        let _ = std::fs::remove_file(filename);
-    }
-
-    #[test]
-    fn test_chain_reorg() {
-        let filename = "test_chain_reorg.json";
-        let _ = std::fs::remove_file(filename);
-
-        // 1. Common chain (Genesis + 2 blocks)
-        let common = build_valid_chain(2, "common.json");
-        
-        // 2. Chain A: Extend common by 1 block
-        let mut chain_a = Blockchain::new(filename);
-        // Add common blocks
-        for b in &common { chain_a.try_add_block(b.clone()); }
-        // Mine block 3A
-        chain_a.add_block(vec![]); 
-        let _block_3a = chain_a.chain.last().unwrap().clone();
-
-        // 3. Chain B: Extend common by 3 blocks (longer)
-        let filename_b = "test_chain_reorg_b.json";
-        let _ = std::fs::remove_file(filename_b);
-        let mut chain_b = Blockchain::new(filename_b);
-        for b in &common { chain_b.try_add_block(b.clone()); }
-        
-        // Mine block 3B (make it different so hash differs)
-        let alice = Wallet::new();
-        let coinbase = Transaction::new_coinbase(&alice.get_public_key(), 3);
-        chain_b.add_block(vec![coinbase]); 
-        // Mine 4B, 5B
-        chain_b.add_block(vec![]);
-        chain_b.add_block(vec![]);
-        
-        // Get the new blocks from B (excluding common 0,1,2)
-        // Chain B: 0, 1, 2, 3, 4, 5
-        let new_blocks_b: Vec<Block> = chain_b.chain.iter().skip(3).cloned().collect(); 
-        
-        // 4. Try to add Chain B blocks to Chain A
-        // `try_add_block_batch` should trigger reorg because 3,4,5 is longer than 3A
-        let (result, _) = chain_a.try_add_block_batch(new_blocks_b);
-        
-        // Verified: It should switch to Chain B
-        assert_eq!(result, 3); // 3 blocks added (reorg success)
-        assert_eq!(chain_a.chain.len(), 6); // 0,1,2,3,4,5
-        assert_eq!(chain_a.chain.last().unwrap().hash, chain_b.chain.last().unwrap().hash);
-        
-        // Cleanup
-        let _ = std::fs::remove_file(filename);
-        let _ = std::fs::remove_file(filename_b);
-        let _ = std::fs::remove_file("common.json");
-    }
-}

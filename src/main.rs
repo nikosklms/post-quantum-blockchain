@@ -5,10 +5,7 @@ mod network;
 mod wallet;
 mod sync;
 #[cfg(test)]
-mod sync_tests;
-
-#[cfg(test)]
-mod debug_exploit;
+mod tests;
 
 use transaction::Transaction;
 use blockchain::Blockchain;

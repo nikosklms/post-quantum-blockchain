@@ -53,9 +53,14 @@ impl Block {
         // A full "0000" prefix in hex is 16 bits.
         let initial_target = "0000ffff00000000000000000000000000000000000000000000000000000000".to_string();
 
+        // Fixed genesis timestamp (Feb 10, 2026 00:00:00 UTC in milliseconds).
+        // Using a fixed value ensures all nodes produce the same genesis hash.
+        // Non-zero so difficulty adjustment works correctly from the first window.
+        let timestamp: u128 = 1_770_681_600_000;
+
         let mut block = Block {
             index: 0,
-            timestamp: 0,
+            timestamp,
             nonce: 0,
             previous_hash: String::from("0"),
             transactions: vec![],

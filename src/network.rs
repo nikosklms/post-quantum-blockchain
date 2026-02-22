@@ -478,10 +478,22 @@ pub fn handle_swarm_event(
                                         }
                                         crate::blockchain::AddBlockResult::Fork => {
                                             println!("🔱 Batch detected fork from peer {}. Triggering reorg sync...", peer);
+                                            let peer_height = sync_manager.peer_heights.get(&peer).copied().unwrap_or(last);
                                             let locators = blockchain.create_locator_hashes();
                                             let req = crate::sync::SyncRequest {
-                                                start_height: 0, 
-                                                end_height: last + 20, 
+                                                start_height: 1, 
+                                                end_height: peer_height, 
+                                                locators: Some(locators),
+                                            };
+                                            let _ = swarm.behaviour_mut().direct_sync.send_request(&peer, req);
+                                        }
+                                        crate::blockchain::AddBlockResult::NeedsReorg => {
+                                            println!("🔄 Chains fully diverged with peer {}. Requesting full chain...", peer);
+                                            let peer_height = sync_manager.peer_heights.get(&peer).copied().unwrap_or(last);
+                                            let locators = blockchain.create_locator_hashes();
+                                            let req = crate::sync::SyncRequest {
+                                                start_height: 1, 
+                                                end_height: peer_height, 
                                                 locators: Some(locators),
                                             };
                                             let _ = swarm.behaviour_mut().direct_sync.send_request(&peer, req);
@@ -574,16 +586,17 @@ pub fn handle_swarm_event(
                                 }
                                 crate::blockchain::AddBlockResult::Fork => {
                                     println!("🔱 Fork detected from peer {}. Triggering reorg sync...", peer_id);
+                                    let peer_height = sync_manager.peer_heights.get(&peer_id).copied().unwrap_or(block.index);
                                     let locators = blockchain.create_locator_hashes();
                                     let req = crate::sync::SyncRequest {
-                                        start_height: 0, 
-                                        end_height: block.index + 20, 
+                                        start_height: 1, 
+                                        end_height: peer_height, 
                                         locators: Some(locators),
                                     };
                                     let _ = swarm.behaviour_mut().direct_sync.send_request(&peer_id, req);
                                     false
                                 }
-                                crate::blockchain::AddBlockResult::Invalid => {
+                                crate::blockchain::AddBlockResult::Invalid | crate::blockchain::AddBlockResult::NeedsReorg => {
                                     println!("Block {} from {} rejected.", block.index, peer_id);
                                     false
                                 }
